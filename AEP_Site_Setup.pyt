@@ -1,0 +1,1 @@
+#-- connect to this table for the list of layers to create: https://services-ap1.arcgis.com/1awYJ9qmpKeoPyqc/arcgis/rest/services/Standard_Connection_Reference_Table/FeatureServer/15. Use the users logged in credentials.
