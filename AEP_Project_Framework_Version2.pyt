@@ -282,7 +282,7 @@ class CreateSubjectSite(object):
             
             arcpy.management.CalculateGeometryAttributes(
                 working_fc,
-                [["SHAPE_Area", "AREA"]],
+                [["SHAPE_Area", "AREA_GEODESIC"]],
                 area_unit="SQUARE_METERS"
             )
             
@@ -647,7 +647,7 @@ class AddStandardProjectLayers(object):
                         
                         arcpy.management.CalculateGeometryAttributes(
                             pct_layer,
-                            [["area_m", "AREA"]],
+                            [["area_m", "AREA_GEODESIC"]],
                             area_unit="SQUARE_METERS"
                         )
                         
