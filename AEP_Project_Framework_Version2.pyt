@@ -94,7 +94,7 @@ class CreateSubjectSite(object):
         if parameters[2].altered:
             proj_name = parameters[2].valueAsText
             if proj_name and len(proj_name) > 150:
-                parameters[2]. setErrorMessage("Project Name must be 150 characters or less")
+                parameters[2].setErrorMessage("Project Name must be 150 characters or less")
         
         return
 
@@ -161,7 +161,7 @@ class CreateSubjectSite(object):
             arcpy.AddMessage("  Calling Esri World Geocoding Service...")
             
             try:
-                with urllib.request. urlopen(url, timeout=30) as response:
+                with urllib.request.urlopen(url, timeout=30) as response:
                     data = json.loads(response.read().decode())
                 
                 # Check for errors
@@ -187,7 +187,7 @@ class CreateSubjectSite(object):
                 
                 arcpy.AddMessage(f"  ✓ Geocoded to: {matched_address}")
                 arcpy.AddMessage(f"  ✓ Match score: {score}")
-                arcpy.AddMessage(f"  ✓ Coordinates (WGS84): {location_x:. 6f}, {location_y:. 6f}")
+                arcpy.AddMessage(f"  ✓ Coordinates (WGS84): {location_x:.6f}, {location_y:.6f}")
                 
                 if score < 80:
                     arcpy.AddWarning(f"  ⚠ Low match score ({score}). Results may not be accurate.")
@@ -210,7 +210,7 @@ class CreateSubjectSite(object):
                 return
             
             # Create a point geometry from the geocoded location
-            geocoded_point = arcpy. PointGeometry(
+            geocoded_point = arcpy.PointGeometry(
                 arcpy.Point(location_x, location_y),
                 arcpy.SpatialReference(4326)
             )
@@ -266,7 +266,7 @@ class CreateSubjectSite(object):
             if property_count > 1:
                 arcpy.AddMessage("\nStep 4: Dissolving multiple polygons into single feature...")
                 dissolved = os.path.join(default_gdb, "temp_dissolved")
-                arcpy.management. Dissolve(
+                arcpy.management.Dissolve(
                     in_features=temp_property,
                     out_feature_class=dissolved,
                     dissolve_field=None,
@@ -282,7 +282,7 @@ class CreateSubjectSite(object):
             
             arcpy.management.CalculateGeometryAttributes(
                 working_fc,
-                [["SHAPE_Area", "AREA"]],
+                [["SHAPE_Area", "AREA_GEODESIC"]],
                 area_unit="SQUARE_METERS"
             )
             
@@ -309,19 +309,19 @@ class CreateSubjectSite(object):
             if arcpy.Exists(output_fc):
                 arcpy.management.Delete(output_fc)
             
-            arcpy.management. CopyFeatures(working_fc, output_fc)
+            arcpy.management.CopyFeatures(working_fc, output_fc)
             
             # Add custom fields
             arcpy.management.AddField(output_fc, "ProjectNumber", "TEXT", field_length=5)
-            arcpy.management. AddField(output_fc, "ProjectName", "TEXT", field_length=150)
+            arcpy.management.AddField(output_fc, "ProjectName", "TEXT", field_length=150)
             arcpy.management.AddField(output_fc, "SiteAddress", "TEXT", field_length=255)
-            arcpy.management. AddField(output_fc, "GeocodedAddress", "TEXT", field_length=255)
+            arcpy.management.AddField(output_fc, "GeocodedAddress", "TEXT", field_length=255)
             arcpy.management.AddField(output_fc, "GeocodeScore", "SHORT")
             arcpy.management.AddField(output_fc, "Longitude", "DOUBLE")
             arcpy.management.AddField(output_fc, "Latitude", "DOUBLE")
             arcpy.management.AddField(output_fc, "SiteArea", "DOUBLE")
             arcpy.management.AddField(output_fc, "AreaUnits", "TEXT", field_length=50)
-            arcpy.management. AddField(output_fc, "CreatedDate", "DATE")
+            arcpy.management.AddField(output_fc, "CreatedDate", "DATE")
             
             # Populate fields
             with arcpy.da.UpdateCursor(output_fc, 
@@ -364,7 +364,7 @@ class CreateSubjectSite(object):
         except Exception as e:
             arcpy.AddError(f"\n✗ Error creating subject site: {str(e)}")
             import traceback
-            arcpy.AddError(traceback. format_exc())
+            arcpy.AddError(traceback.format_exc())
         
         return
 
@@ -409,7 +409,7 @@ class AddStandardProjectLayers(object):
         
         study_area_fc = parameters[0].valueAsText
         
-        arcpy. AddMessage("="*60)
+        arcpy.AddMessage("="*60)
         arcpy.AddMessage("STEP 2 - ADD STANDARD PROJECT LAYERS")
         arcpy.AddMessage("="*60)
         
@@ -420,17 +420,17 @@ class AddStandardProjectLayers(object):
             
             reference_table_url = "https://services-ap1.arcgis.com/1awYJ9qmpKeoPyqc/arcgis/rest/services/Standard_Connection_Reference_Table/FeatureServer/15"
             
-            arcpy. AddMessage("Querying standard connection reference table...")
+            arcpy.AddMessage("Querying standard connection reference table...")
             
             temp_table = "temp_reference_table"
-            arcpy. management.MakeTableView(reference_table_url, temp_table)
+            arcpy.management.MakeTableView(reference_table_url, temp_table)
             
             reference_records = []
             fields = ["URL", "SiteBuffer", "BufferAction", "FeatureDatasetName", "LayerName"]
             
             with arcpy.da.SearchCursor(temp_table, fields) as cursor:
                 for row in cursor:
-                    reference_records. append({
+                    reference_records.append({
                         "url": row[0],
                         "buffer_distance": row[1],
                         "buffer_action": row[2],
@@ -464,11 +464,11 @@ class AddStandardProjectLayers(object):
                     temp_source = f"temp_source_{idx}"
                     arcpy.management.MakeFeatureLayer(source_url, temp_source)
                     
-                    buffer_action = record['buffer_action']. upper()
+                    buffer_action = record['buffer_action'].upper()
                     
                     if buffer_action == "INTERSECT":
-                        arcpy. AddMessage("  Selecting features that intersect buffer...")
-                        arcpy.management. SelectLayerByLocation(
+                        arcpy.AddMessage("  Selecting features that intersect buffer...")
+                        arcpy.management.SelectLayerByLocation(
                             in_layer=temp_source,
                             overlap_type="INTERSECT",
                             select_features=temp_buffer,
@@ -500,8 +500,8 @@ class AddStandardProjectLayers(object):
                         feature_dataset = os.path.join(default_gdb, feature_dataset_name)
                         
                         if not arcpy.Exists(feature_dataset):
-                            arcpy. AddMessage(f"  Creating feature dataset:  {feature_dataset_name}")
-                            arcpy. AddMessage(f"  Using GDA2020 NSW Lambert (EPSG:7858)")
+                            arcpy.AddMessage(f"  Creating feature dataset:  {feature_dataset_name}")
+                            arcpy.AddMessage(f"  Using GDA2020 NSW Lambert (EPSG:7858)")
                             sr = arcpy.SpatialReference(7858)
                             arcpy.management.CreateFeatureDataset(
                                 default_gdb,
@@ -514,18 +514,18 @@ class AddStandardProjectLayers(object):
                         output_fc = os.path.join(default_gdb, record['layer_name'])
                     
                     if arcpy.Exists(output_fc):
-                        arcpy. management.Delete(output_fc)
+                        arcpy.management.Delete(output_fc)
                     
                     if buffer_action == "CLIP":
                         arcpy.AddMessage("  Clipping features to buffer...")
-                        arcpy. analysis.Clip(
+                        arcpy.analysis.Clip(
                             in_features=temp_source,
                             clip_features=temp_buffer,
                             out_feature_class=output_fc
                         )
                     else: 
                         arcpy.AddMessage("  Copying selected features...")
-                        arcpy.management. CopyFeatures(temp_source, output_fc)
+                        arcpy.management.CopyFeatures(temp_source, output_fc)
                     
                     final_result = arcpy.management.GetCount(output_fc)
                     final_count = int(final_result.getOutput(0))
@@ -535,7 +535,7 @@ class AddStandardProjectLayers(object):
                         arcpy.management.Delete(output_fc)
                         continue
                     
-                    arcpy. AddMessage("  Adding metadata fields...")
+                    arcpy.AddMessage("  Adding metadata fields...")
                     
                     existing_fields = [f.name for f in arcpy.ListFields(output_fc)]
                     
@@ -577,10 +577,10 @@ class AddStandardProjectLayers(object):
                     if arcpy.Exists(site_lots_report):
                         arcpy.management.Delete(site_lots_report)
                     
-                    available_fields = [f.name. lower() for f in arcpy.ListFields(lots_layer)]
+                    available_fields = [f.name.lower() for f in arcpy.ListFields(lots_layer)]
                     arcpy.AddMessage(f"  Available fields: {', '.join(available_fields)}")
                     
-                    field_mappings = arcpy. FieldMappings()
+                    field_mappings = arcpy.FieldMappings()
                     field_mappings.addTable(lots_layer)
                     
                     fields_to_map = {
@@ -590,14 +590,14 @@ class AddStandardProjectLayers(object):
                     }
                     
                     for field in field_mappings.fields:
-                        if field.name.lower() not in fields_to_map. keys():
+                        if field.name.lower() not in fields_to_map.keys():
                             field_map_index = field_mappings.findFieldMapIndex(field.name)
                             if field_map_index >= 0:
                                 field_mappings.removeFieldMap(field_map_index)
                     
                     for old_name, new_name in fields_to_map.items():
                         try:
-                            field_map_index = field_mappings. findFieldMapIndex(old_name)
+                            field_map_index = field_mappings.findFieldMapIndex(old_name)
                             if field_map_index >= 0:
                                 field_map = field_mappings.getFieldMap(field_map_index)
                                 output_field = field_map.outputField
@@ -638,7 +638,7 @@ class AddStandardProjectLayers(object):
                     if pct_count == 0:
                         arcpy.AddWarning("  SVTM_PCT layer is empty, skipping PCT_Report\n")
                     else:
-                        arcpy. AddMessage(f"  Processing {pct_count} PCT polygons...")
+                        arcpy.AddMessage(f"  Processing {pct_count} PCT polygons...")
                         arcpy.AddMessage("  Calculating polygon areas in m²...")
                         
                         existing_fields = [f.name for f in arcpy.ListFields(pct_layer)]
@@ -647,7 +647,7 @@ class AddStandardProjectLayers(object):
                         
                         arcpy.management.CalculateGeometryAttributes(
                             pct_layer,
-                            [["area_m", "AREA"]],
+                            [["area_m", "AREA_GEODESIC"]],
                             area_unit="SQUARE_METERS"
                         )
                         
@@ -684,7 +684,7 @@ class AddStandardProjectLayers(object):
                         
                         arcpy.AddMessage(f"  ✓ PCT_Report created: {pct_count} records\n")
                 else:
-                    arcpy. AddWarning("  ✗ SVTM_PCT layer not found, skipping PCT_Report\n")
+                    arcpy.AddWarning("  ✗ SVTM_PCT layer not found, skipping PCT_Report\n")
             except Exception as e:
                 arcpy.AddWarning(f"  ✗ Error creating PCT_Report:  {str(e)}\n")
             
@@ -696,6 +696,6 @@ class AddStandardProjectLayers(object):
         except Exception as e: 
             arcpy.AddError(f"Error adding standard project layers: {str(e)}")
             import traceback
-            arcpy.AddError(traceback. format_exc())
+            arcpy.AddError(traceback.format_exc())
         
         return
