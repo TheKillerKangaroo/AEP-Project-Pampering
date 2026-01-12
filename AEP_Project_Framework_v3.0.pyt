@@ -12,6 +12,7 @@ import urllib.request
 import urllib.parse
 from datetime import datetime
 import time
+import re
 
 # Global Path to Layer File (Standard Styling)
 LAYERFILE_PATH = r"G:\Shared drives\99.3 GIS Admin\Production\Layer Files\AEP - Study Area.lyrx"
@@ -406,6 +407,33 @@ class CreateSubjectSite(object):
         force_requery: boolean - if True, re-query the service and refresh the output even if it exists
                         (will still respect overwrite_flag regarding whether to replace).
         """
+
+        def _sanitize_fc_name(name, max_len=63):
+            """
+            Produce a geodatabase-safe feature class name from an arbitrary display name:
+            - replace any non-alphanumeric/underscore with underscore
+            - collapse multiple underscores
+            - strip leading/trailing underscores
+            - prefix with 'f_' if it starts with a digit
+            - truncate to max_len characters
+            """
+            if not name:
+                return "layer"
+            # replace invalid chars with underscore
+            s = re.sub(r'[^0-9A-Za-z_]', '_', str(name))
+            # collapse multiple underscores
+            s = re.sub(r'_{2,}', '_', s)
+            s = s.strip('_')
+            if not s:
+                s = "layer"
+            # prefix if starts with digit
+            if re.match(r'^\d', s):
+                s = f"f_{s}"
+            # truncate
+            if len(s) > max_len:
+                s = s[:max_len]
+            return s
+
         reference_table_url = "https://services-ap1.arcgis.com/1awYJ9qmpKeoPyqc/arcgis/rest/services/Standard_Connection_Reference_Table/FeatureServer/15"
         arcpy.AddMessage("=" * 60)
         arcpy.AddMessage("STEP 2 - ADD PROJECT LAYERS (continuing from Step 1)")
@@ -435,7 +463,7 @@ class CreateSubjectSite(object):
 
             # Query the Standard Connection Reference Table for ProjectType = "all"
             arcpy.AddMessage("Querying Standard Connection Reference Table for ProjectType = 'all' ...")
-            params = {"where": "ProjectType='all'", "outFields": "*", "f": "json"}
+            params = {"where": "ProjectType='all'", "outFields": "*", "f": "json", "orderByFields": "SortOrder ASC"}
             if token:
                 params["token"] = token
             query_url = f"{reference_table_url}/query?{urllib.parse.urlencode(params)}"
@@ -446,7 +474,7 @@ class CreateSubjectSite(object):
             if not features:
                 arcpy.AddWarning("No standard connections found for ProjectType = 'all'.")
             else:
-                arcpy.AddMessage(f"  ✓ Found {len(features)} reference records.")
+                arcpy.AddMessage(f"  ✓ Found {len(features)} reference records (ordered by SortOrder).")
 
             processed_outputs = []  # track extracted layers for reports
 
@@ -494,6 +522,9 @@ class CreateSubjectSite(object):
                         continue
                 return None
 
+            # Track whether we've created the Site Details Map in this run so we can add the study area first
+            site_map_created_in_run = False
+
             for idx, feat in enumerate(features, start=1):
                 attrs = feat.get("attributes", {})
                 service_url = _get_attr_ci(attrs, "URL") or _get_attr_ci(attrs, "Url") or _get_attr_ci(attrs, "url")
@@ -501,8 +532,12 @@ class CreateSubjectSite(object):
                 buffer_action = _get_attr_ci(attrs, "BufferAction") or _get_attr_ci(attrs, "bufferaction") or "INTERSECT"
                 feature_dataset_name = _get_attr_ci(attrs, "FeatureDatasetName") or _get_attr_ci(attrs, "FeatureDataset") or "ProjectData"
                 short_name = _get_attr_ci(attrs, "ShortName") or _get_attr_ci(attrs, "Shortname") or f"Layer_{idx}"
+                style_file = _get_attr_ci(attrs, "Style") or _get_attr_ci(attrs, "LayerFile") or _get_attr_ci(attrs, "lyrx")
 
-                arcpy.AddMessage(f"Processing reference record {idx}: ShortName='{short_name}' URL='{service_url}' Buffer={site_buffer} Action={buffer_action}")
+                # create a sanitized feature class name for use inside the geodatabase
+                safe_short = _sanitize_fc_name(short_name)
+
+                arcpy.AddMessage(f"Processing reference record {idx}: ShortName='{short_name}' (safe: '{safe_short}') URL='{service_url}' Buffer={site_buffer} Action={buffer_action} Style='{style_file or ''}'")
 
                 # Validate service URL
                 if not service_url:
@@ -525,7 +560,7 @@ class CreateSubjectSite(object):
 
                 # Build intended output path early (for quick existence check)
                 fd_path = os.path.join(default_gdb, feature_dataset_name)
-                out_fc = os.path.join(fd_path, short_name)
+                out_fc = os.path.join(fd_path, safe_short)
 
                 # QUICK EXISTENCE CHECK (to avoid unnecessary service calls)
                 if arcpy.Exists(out_fc):
@@ -543,7 +578,7 @@ class CreateSubjectSite(object):
                     distance_m = 0.0
 
                 if distance_m > 0:
-                    buffer_fc = os.path.join("memory", f"buf_{short_name}")
+                    buffer_fc = os.path.join("memory", f"buf_{safe_short}")
                     if arcpy.Exists(buffer_fc):
                         arcpy.management.Delete(buffer_fc)
                     arcpy.analysis.Buffer(study_area_fc, buffer_fc, f"{distance_m} Meters", method="GEODESIC")
@@ -632,14 +667,19 @@ class CreateSubjectSite(object):
                         if token:
                             qparams["token"] = token
 
-                        # Retry loop for fallback query (3 attempts, short backoff)
+                        # Retry loop for fallback query (attempt up to 3 times with backoff).
+                        # If a 498 Invalid Token error is encountered, retry once without the token.
                         object_ids = []
                         last_err = None
                         qurl_used = None
-                        for attempt in range(3):
+                        attempt = 0
+                        max_attempts = 3
+                        tried_without_token = False
+
+                        while attempt < max_attempts:
                             qurl = f"{query_layer_url}?{urllib.parse.urlencode(qparams)}"
                             qurl_used = qurl
-                            arcpy.AddMessage(f"  - REST fallback query URL (attempt {attempt+1}): {qurl}")
+                            arcpy.AddMessage(f"  - REST fallback query URL (attempt {attempt+1}{' (no token)' if tried_without_token else ''}): {qurl}")
                             try:
                                 with urllib.request.urlopen(qurl, timeout=120) as qresp:
                                     qdata = json.loads(qresp.read().decode())
@@ -647,14 +687,32 @@ class CreateSubjectSite(object):
                                 if "error" in qdata:
                                     last_err = qdata["error"]
                                     arcpy.AddWarning(f"  - REST fallback returned error: {last_err}")
+                                    # If it's an invalid token error, retry once without token
+                                    try:
+                                        err_code = int(last_err.get("code", 0)) if isinstance(last_err, dict) else 0
+                                    except Exception:
+                                        err_code = 0
+                                    if err_code == 498 and not tried_without_token:
+                                        # remove token and retry immediately (do not consume one of the configured attempts)
+                                        if "token" in qparams:
+                                            qparams.pop("token", None)
+                                        tried_without_token = True
+                                        arcpy.AddMessage("  - Received 498 Invalid Token; retrying fallback without token.")
+                                        # do not increment attempt here so we still allow up to max_attempts attempts without token
+                                        continue
+                                    # normal error; wait and retry
+                                    attempt += 1
                                     time.sleep(3)
                                     continue
+
                                 object_ids = qdata.get("objectIds") or []
-                                # success if we got object ids
+                                # success if we got object ids (or empty list but query succeeded)
                                 break
+
                             except Exception as e:
                                 last_err = e
                                 arcpy.AddWarning(f"  - REST fallback HTTP error on attempt {attempt+1}: {e}")
+                                attempt += 1
                                 time.sleep(3)
 
                         # store qurl for diagnostics if fallback produced no object ids
@@ -745,7 +803,7 @@ class CreateSubjectSite(object):
 
                 # Write to a temporary output first (in default_gdb) then replace existing only on success
                 timestamp = int(time.time())
-                tmp_out = os.path.join(default_gdb, f"tmp_extract_{short_name}_{timestamp}")
+                tmp_out = os.path.join(default_gdb, f"tmp_extract_{safe_short}_{timestamp}")
                 try:
                     if buffer_action and buffer_action.strip().upper() == "CLIP":
                         # Clip to buffer -> write to tmp_out
@@ -822,7 +880,7 @@ class CreateSubjectSite(object):
                         pass
 
                     arcpy.AddMessage(f"  ✓ Extracted '{short_name}' to {out_fc}")
-                    processed_outputs.append({"shortname": short_name, "path": out_fc})
+                    processed_outputs.append({"shortname": short_name, "path": out_fc, "style": style_file, "fd": feature_dataset_name, "safe_short": safe_short})
 
                     # --- NEW: Add the output layer to "Site Details Map" and place it in a group named after the feature dataset ---
                     try:
@@ -835,6 +893,7 @@ class CreateSubjectSite(object):
                             try:
                                 # create the map with default type (MAP). Do not pass basemap name as map_type.
                                 site_map = aprx.createMap("Site Details Map")
+                                site_map_created_in_run = True
                                 arcpy.AddMessage("  ✓ Created 'Site Details Map'.")
                                 # Attempt to apply Imagery Hybrid basemap if the API supports it
                                 try:
@@ -854,14 +913,81 @@ class CreateSubjectSite(object):
                                 site_map = None
 
                         if site_map:
-                            # Add the feature class to the map
+                            # If we just created the map in this run, add the Project Study Area layer first (once)
+                            try:
+                                if site_map_created_in_run:
+                                    try:
+                                        # Add PSA using its path (study_area_fc is a memory FC path)
+                                        psa_layer = site_map.addDataFromPath(study_area_fc)
+                                        # set its name and attempt to style using global LAYERFILE_PATH
+                                        try:
+                                            psa_layer.name = f"Project Study Area {project_number}"
+                                        except:
+                                            pass
+                                        # apply standard styling if available
+                                        try:
+                                            if os.path.exists(LAYERFILE_PATH):
+                                                arcpy.management.ApplySymbologyFromLayer(psa_layer, LAYERFILE_PATH)
+                                                arcpy.AddMessage("  ✓ Applied standard Study Area symbology to Project Study Area layer.")
+                                            else:
+                                                arcpy.AddWarning("  - Standard Study Area layer file not found to apply styling.")
+                                        except Exception as e_sym:
+                                            arcpy.AddWarning(f"  - Could not apply standard symbology to Project Study Area: {e_sym}")
+
+                                        # try to set a definition query on the PSA layer if supported
+                                        try:
+                                            if psa_layer.supports("DEFINITIONQUERY"):
+                                                dq = f"project_number = '{project_number}' AND EndDate IS Null"
+                                                psa_layer.definitionQuery = dq
+                                                arcpy.AddMessage("  ✓ Applied definition query to Project Study Area layer.")
+                                        except Exception:
+                                            pass
+                                    except Exception as eaddpsa:
+                                        arcpy.AddWarning(f"  - Could not add Project Study Area layer to 'Site Details Map': {eaddpsa}")
+                                    # Ensure we don't add it again during this run
+                                    site_map_created_in_run = False
+
+                            except Exception:
+                                pass
+
+                            # Add the feature class to the map (this will place it after existing layers unless we inserted)
                             try:
                                 new_layer = site_map.addDataFromPath(out_fc)
-                                # Try to name the layer sensibly
+                                # Try to name the layer sensibly (display name)
                                 try:
                                     new_layer.name = short_name
                                 except:
                                     pass
+
+                                # If the reference record provides a style layer file and it exists, apply it
+                                if style_file:
+                                    # style_file could be a path; try to expand user vars and check
+                                    style_path = os.path.expanduser(style_file)
+                                    if not os.path.isabs(style_path):
+                                        # try relative to project home or default GDB folder, try a couple of sensible locations
+                                        try_paths = [
+                                            style_path,
+                                            os.path.join(os.path.dirname(arcpy.mp.ArcGISProject("CURRENT").filePath or ""), style_path),
+                                            os.path.join(default_gdb, style_path)
+                                        ]
+                                    else:
+                                        try_paths = [style_path]
+
+                                    applied = False
+                                    for sp in try_paths:
+                                        try:
+                                            if os.path.exists(sp):
+                                                try:
+                                                    arcpy.management.ApplySymbologyFromLayer(new_layer, sp)
+                                                    arcpy.AddMessage(f"  ✓ Applied style from '{sp}' to layer '{short_name}'.")
+                                                    applied = True
+                                                    break
+                                                except Exception as ase:
+                                                    arcpy.AddWarning(f"  - Could not apply symbology from '{sp}' to '{short_name}': {ase}")
+                                        except Exception:
+                                            continue
+                                    if not applied:
+                                        arcpy.AddMessage(f"  - No valid style file found or applied for '{short_name}' (checked {len(try_paths)} locations).")
 
                                 # Find or create a group layer with the feature dataset name
                                 group_layer = None
