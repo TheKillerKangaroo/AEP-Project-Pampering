@@ -184,6 +184,12 @@ class CreateSubjectSite(object):
         arcpy.AddMessage("STEP 1 - CREATE SUBJECT SITE (and optionally continue to standard extracts)")
         arcpy.AddMessage("=" * 60)
 
+        # track a few summary bits for funky final message
+        archived_count = 0
+        appended_success = False
+        matched_address = ""
+        area_ha = 0.0
+
         try:
             aprx = arcpy.mp.ArcGISProject("CURRENT")
             default_gdb = aprx.defaultGeodatabase
@@ -312,6 +318,7 @@ class CreateSubjectSite(object):
                                 urow[0] = now_dt
                                 ucur.updateRow(urow)
                         arcpy.AddMessage("  ✓ Archived existing record(s) by updating EndDate.")
+                        archived_count = existing_count
                     except Exception as ue:
                         arcpy.AddWarning(f"  - Could not update EndDate on remote service: {ue}")
                 else:
@@ -325,7 +332,12 @@ class CreateSubjectSite(object):
 
             # 4. Append to Feature Service
             arcpy.AddMessage("Writing to feature service...")
-            arcpy.management.Append(working_fc, target_layer_url, "NO_TEST")
+            try:
+                arcpy.management.Append(working_fc, target_layer_url, "NO_TEST")
+                appended_success = True
+            except Exception as e:
+                arcpy.AddError(f"Failed to append to feature service: {e}")
+                appended_success = False
 
             # 5. Clean up intermediate fc (we keep working_fc for further processing if it's in default gdb)
             # Note: working_fc is already in default_gdb (temp_property or temp_dissolved)
@@ -361,6 +373,20 @@ class CreateSubjectSite(object):
                     arcpy.AddError(f"Error while running Step 2 after Step 1: {e}")
             else:
                 arcpy.AddMessage("Step 2 was not requested to run automatically. Process completed after Step 1.")
+
+            # Funky final messaging for Step 1
+            arcpy.AddMessage("\n" + ("🎉" * 12))
+            arcpy.AddMessage("FUNKY SUMMARY — STEP 1")
+            arcpy.AddMessage("-" * 40)
+            arcpy.AddMessage(f"Project: {project_number} — {project_name}")
+            arcpy.AddMessage(f"Address used: {matched_address or 'N/A'}")
+            arcpy.AddMessage(f"Site area: {area_ha:.2f} hectares")
+            arcpy.AddMessage(f"Records archived on service: {archived_count}")
+            arcpy.AddMessage(f"Appended to feature service: {'Yes' if appended_success else 'No'}")
+            arcpy.AddMessage(f"Automatic STEP 2 run: {'Yes' if run_step2_flag else 'No'}")
+            arcpy.AddMessage("-" * 40)
+            arcpy.AddMessage("May the maps be ever in your favour. 🗺️")
+            arcpy.AddMessage(("🎉" * 12) + "\n")
 
             arcpy.AddMessage("\nSUCCESS!")
 
@@ -864,7 +890,7 @@ class CreateSubjectSite(object):
 
                     arcpy.AddMessage(f"  ✓ PCT_Report created: {pct_table}")
 
-            # Final summary of processing for QA
+            # Final summary of processing for QA (existing summary retained)
             arcpy.AddMessage("\nExtraction summary:")
             arcpy.AddMessage(f"  - Extracted new layers: {len(extracted_new)}")
             if extracted_new:
@@ -878,6 +904,23 @@ class CreateSubjectSite(object):
             arcpy.AddMessage(f"  - Failed layers: {len(failed)}")
             if failed:
                 arcpy.AddMessage(f"    {failed}")
+
+            # FUNKY final summary block for Step 2
+            arcpy.AddMessage("\n" + ("✨" * 12))
+            arcpy.AddMessage("🌈 FUNKY FINAL REPORT — STEP 2 🌈")
+            arcpy.AddMessage("-" * 50)
+            arcpy.AddMessage(f"Project: {project_number}")
+            arcpy.AddMessage(f"Total reference records attempted: {len(features)}")
+            arcpy.AddMessage(f"New extractions: {len(extracted_new)}  |  Replacements: {len(replaced)}  |  Skipped: {len(skipped)}  |  Failed: {len(failed)}")
+            arcpy.AddMessage("\nDetailed lists:")
+            arcpy.AddMessage(f"  - Extracted: {extracted_new if extracted_new else 'None'}")
+            arcpy.AddMessage(f"  - Replaced: {replaced if replaced else 'None'}")
+            arcpy.AddMessage(f"  - Skipped: {skipped if skipped else 'None'}")
+            arcpy.AddMessage(f"  - Failed: {failed if failed else 'None'}")
+            arcpy.AddMessage("-" * 50)
+            arcpy.AddMessage(f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            arcpy.AddMessage("If anything failed, check warnings above and re-run with force re-query or enable overwrite as needed.")
+            arcpy.AddMessage(("✨" * 12) + "\n")
 
             arcpy.AddMessage("\nSTEP 2 COMPLETE - Standard project layers extracted and reports created.")
 
@@ -1040,6 +1083,11 @@ class AddStandardProjectLayers(object):
             # Hand over to the CreateSubjectSite implementation to run the step2 flow,
             # passing the overwrite and force_requery flags from the tool UI.
             CreateSubjectSite()._run_step2_with_study_area(aprx, study_area_fc, project_number, overwrite_flag, force_requery)
+
+            # Add a small funky ending for standalone Step 2
+            arcpy.AddMessage("\n🎈🎈🎈 Standalone STEP 2 complete — party time! 🎈🎈🎈")
+            arcpy.AddMessage(f"Project {project_number}: standard layers added (see messages above for details).")
+            arcpy.AddMessage("Tip: Re-run with 'Force re-query' or 'Overwrite' if you expected different results.\n")
 
             arcpy.AddMessage("\nSUCCESS - Project Layers Added.")
 
