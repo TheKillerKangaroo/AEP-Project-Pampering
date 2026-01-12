@@ -474,22 +474,112 @@ class CreateSubjectSite(object):
 
                 # 2.2 Connect to the target feature layer and subset by buffer polygon
                 temp_layer_name = f"temp_layer_{idx}_{int(time.time())}"
+                made_layer = False
                 try:
+                    # Try the normal approach first
                     arcpy.management.MakeFeatureLayer(service_url, temp_layer_name)
+                    made_layer = True
                 except Exception as e:
                     arcpy.AddWarning(f"  - Could not make feature layer from URL '{service_url}': {e}")
-                    if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
-                        arcpy.management.Delete(buffer_fc)
-                    failed.append(short_name)
-                    continue
+                    # we'll try the REST fallback below
 
-                # Select by location
+                # Attempt a spatial selection. If it fails, fall back to a REST query for OBJECTIDs and recreate the layer with a WHERE clause.
+                selection_succeeded = False
                 try:
-                    arcpy.management.SelectLayerByLocation(temp_layer_name, "INTERSECT", buffer_fc)
-                except Exception as e:
-                    arcpy.AddWarning(f"  - Selection by location failed for '{short_name}': {e}")
+                    if made_layer:
+                        arcpy.management.SelectLayerByLocation(temp_layer_name, "INTERSECT", buffer_fc)
+                        selection_succeeded = True
+                    else:
+                        raise Exception("Layer creation failed; attempting REST fallback")
+                except Exception as sel_err:
+                    arcpy.AddWarning(f"  - Selection by location failed for '{short_name}': {sel_err}")
+                    # Clean up any partially created layer
                     try:
-                        arcpy.management.Delete(temp_layer_name)
+                        if made_layer:
+                            arcpy.management.Delete(temp_layer_name)
+                    except:
+                        pass
+
+                    # REST fallback: query the service /query endpoint for OBJECTIDs intersecting the buffer geometry
+                    try:
+                        # get a single geometry JSON from buffer_fc (esri JSON)
+                        geom_json = None
+                        with arcpy.da.SearchCursor(buffer_fc, ["SHAPE@"]) as gcur:
+                            for grow in gcur:
+                                geom_json = grow[0].JSON
+                                break
+
+                        if not geom_json:
+                            arcpy.AddWarning(f"  - Could not obtain geometry JSON for fallback on '{short_name}'.")
+                            raise Exception("No geometry available for fallback query")
+
+                        query_layer_url = service_url.rstrip('/') + "/query"
+                        qparams = {
+                            "geometry": geom_json,
+                            "geometryType": "esriGeometryPolygon",
+                            "spatialRel": "esriSpatialRelIntersects",
+                            "inSR": "4326",
+                            "returnIdsOnly": "true",
+                            "f": "json"
+                        }
+                        if token:
+                            qparams["token"] = token
+
+                        qurl = f"{query_layer_url}?{urllib.parse.urlencode(qparams)}"
+                        with urllib.request.urlopen(qurl, timeout=60) as qresp:
+                            qdata = json.loads(qresp.read().decode())
+
+                        object_ids = qdata.get("objectIds") or []
+                        if not object_ids:
+                            arcpy.AddMessage(f"  - REST query returned no features for '{short_name}'; skipping.")
+                            failed.append(short_name)
+                            # ensure no leftover
+                            try:
+                                if arcpy.Exists(temp_layer_name):
+                                    arcpy.management.Delete(temp_layer_name)
+                            except:
+                                pass
+                            continue
+
+                        # Determine object id field name if provided
+                        oid_field = qdata.get("objectIdFieldName") or "OBJECTID"
+                        # Create a WHERE clause safely (OBJECTID list) and make a layer from the service using that filter
+                        id_list = ",".join(str(int(i)) for i in object_ids)
+                        where_ids = f"{oid_field} IN ({id_list})"
+                        try:
+                            arcpy.management.MakeFeatureLayer(service_url, temp_layer_name, where_clause=where_ids)
+                        except Exception as e2:
+                            arcpy.AddWarning(f"  - Could not create filtered layer from service for '{short_name}': {e2}")
+                            failed.append(short_name)
+                            # ensure no leftover
+                            try:
+                                if arcpy.Exists(temp_layer_name):
+                                    arcpy.management.Delete(temp_layer_name)
+                            except:
+                                pass
+                            continue
+
+                        # selection with the filtered layer is effectively successful
+                        selection_succeeded = True
+
+                    except Exception as fb_err:
+                        arcpy.AddWarning(f"  - REST fallback failed for '{short_name}': {fb_err}")
+                        # nothing more we can do for this reference record
+                        failed.append(short_name)
+                        # ensure no leftover
+                        try:
+                            if arcpy.Exists(temp_layer_name):
+                                arcpy.management.Delete(temp_layer_name)
+                        except:
+                            pass
+                        continue
+
+                # At this point selection_succeeded indicates we have a usable temp_layer_name (either original selection or filtered layer)
+                if not selection_succeeded:
+                    arcpy.AddWarning(f"  - Could not select features for '{short_name}'; skipping.")
+                    try:
+                        if arcpy.Exists(temp_layer_name):
+                            arcpy.management.Delete(temp_layer_name)
                     except:
                         pass
                     if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
@@ -668,11 +758,38 @@ class CreateSubjectSite(object):
                     plan_area_units_f = find_field(["planlotareaunits", "plan_lot_area_units", "planlotareaunits"])
 
                     insert_fields = ["Lot", "Section", "Plan", "PlanLotArea", "PlanLotAreaUnits"]
-                    # Use searchcursor on selected lots (via lots_layer) so we only insert selected features
+                    # Build a SearchCursor field list containing only existing fields
                     src_field_list = [lot_f, section_f, plan_f, plan_area_f, plan_area_units_f]
-                    with arcpy.da.InsertCursor(report_table, insert_fields) as ins, arcpy.da.SearchCursor(lots_layer, src_field_list) as src:
-                        for srow in src:
-                            ins.insertRow(srow)
+                    actual_src_fields = [f for f in src_field_list if f]
+                    if not actual_src_fields:
+                        arcpy.AddWarning("No suitable source fields found in Lots layer to build SiteLotsReport; skipping SiteLotsReport.")
+                    else:
+                        # Use searchcursor on selected lots (via lots_layer) so we only insert selected features
+                        with arcpy.da.InsertCursor(report_table, insert_fields) as ins, arcpy.da.SearchCursor(lots_layer, actual_src_fields) as src:
+                            for srow in src:
+                                # Map values back to the fixed insert order, filling defaults where source fields missing
+                                out_row = []
+                                for fld in [lot_f, section_f, plan_f, plan_area_f, plan_area_units_f]:
+                                    if fld:
+                                        # find index of fld in actual_src_fields
+                                        try:
+                                            idx = actual_src_fields.index(fld)
+                                            val = srow[idx]
+                                        except ValueError:
+                                            val = None
+                                    else:
+                                        val = None
+
+                                    # apply sensible defaults: text -> '', numeric -> None
+                                    if val is None:
+                                        if fld == plan_area_f:
+                                            out_row.append(None)
+                                        else:
+                                            out_row.append('')
+                                    else:
+                                        out_row.append(val)
+                                ins.insertRow(out_row)
+
                     arcpy.AddMessage(f"  ✓ SiteLotsReport created: {report_table}")
                 except Exception as e:
                     arcpy.AddWarning(f"  - Error creating SiteLotsReport: {e}")
@@ -683,7 +800,7 @@ class CreateSubjectSite(object):
                         pass
 
             # 5. Create the PCT_Report table
-            arcpy.AddMessage("Creating PCT_Report table...")
+            arcpy.AddMessage("Creating PCT_REPORT table...")
             pct_fc = None
             for po in processed_outputs:
                 if "pct" in po["shortname"].lower() or "svtm_pct" in po["shortname"].lower():
@@ -818,16 +935,23 @@ class AddStandardProjectLayers(object):
             return None
 
     def _get_unique_project_numbers(self, target_layer_url, token):
-        params = {"where": "1=1", "outFields": "project_number", "returnDistinctValues": "true", "f": "json"}
+        # Return distinct project_number values only from active records (EndDate IS NULL)
+        params = {"where": "EndDate IS NULL", "outFields": "project_number", "returnDistinctValues": "true", "f": "json"}
         if token:
             params["token"] = token
         query_url = f"{target_layer_url}/query?{urllib.parse.urlencode(params)}"
         with urllib.request.urlopen(query_url, timeout=30) as resp:
             data = json.loads(resp.read().decode())
-        return sorted([feat['attributes']['project_number'] for feat in data.get('features', []) if feat['attributes']['project_number']])
+        # Build unique sorted list (ensure strings, exclude nulls)
+        values = sorted({str(feat['attributes'].get('project_number')) for feat in data.get('features', []) if feat['attributes'].get('project_number') is not None})
+        return values
 
     def _get_study_area_by_project_number(self, target_layer_url, token, project_number):
-        where = f"project_number='{project_number}'".replace("'", "''")
+        # Safely escape single quotes inside the project_number value only
+        safe_project_number = project_number.replace("'", "''") if project_number else project_number
+        # Ensure we select only the active record(s) (EndDate IS NULL) for the project number
+        where = f"project_number='{safe_project_number}' AND EndDate IS NULL"
+
         params = {"where": where, "outFields": "*", "returnGeometry": "true", "outSR": "4326", "f": "json"}
         if token:
             params["token"] = token
@@ -836,7 +960,7 @@ class AddStandardProjectLayers(object):
         with urllib.request.urlopen(query_url, timeout=30) as resp:
             data = json.loads(resp.read().decode())
 
-        if not data['features']:
+        if not data.get('features'):
             return None
 
         feat = data['features'][0]
@@ -860,9 +984,19 @@ class AddStandardProjectLayers(object):
         url = "https://services-ap1.arcgis.com/1awYJ9qmpKeoPyqc/arcgis/rest/services/Project_Study_Area/FeatureServer/0"
         try:
             token = self._get_token()
-            parameters[0].filter.list = self._get_unique_project_numbers(url, token)
-        except:
-            pass
+            # Always attempt to refresh the project number list from the service so the dropdown is up to date
+            list_values = self._get_unique_project_numbers(url, token)
+            parameters[0].filter.list = list_values
+
+            # if the current parameter value matches a returned project number, make sure it's selected
+            if parameters[0].valueAsText and parameters[0].valueAsText in list_values:
+                parameters[0].value = parameters[0].valueAsText
+        except Exception as e:
+            # don't block the UI; show a warning to help troubleshooting
+            try:
+                arcpy.AddWarning(f"Could not refresh project number list from service: {e}")
+            except:
+                pass
         return
 
     def execute(self, parameters, messages):
@@ -885,12 +1019,22 @@ class AddStandardProjectLayers(object):
 
             token = self._get_token()
 
-            # 1. Retrieve the study area
-            arcpy.AddMessage(f"Retrieving study area for Project {project_number}...")
+            # Re-query the service to ensure we have the latest list before proceeding
+            try:
+                latest_list = self._get_unique_project_numbers(target_layer_url, token)
+                if project_number not in latest_list:
+                    arcpy.AddWarning(f"Project number '{project_number}' was not found in the current service list. Re-querying will still be attempted.")
+                else:
+                    arcpy.AddMessage(f"Project number '{project_number}' confirmed in service ({len(latest_list)} total projects).")
+            except Exception as e:
+                arcpy.AddWarning(f"Could not refresh project number list before execution: {e}")
+
+            # 1. Retrieve the study area (only active records: EndDate IS NULL)
+            arcpy.AddMessage(f"Retrieving study area for Project {project_number} (EndDate IS NULL)...")
             study_area_fc = self._get_study_area_by_project_number(target_layer_url, token, project_number)
 
             if not study_area_fc:
-                arcpy.AddError(f"Could not find study area for Project {project_number}")
+                arcpy.AddError(f"Could not find an active (EndDate IS NULL) study area for Project {project_number}. Ensure the project exists and has EndDate = NULL in the service.")
                 return
 
             # Hand over to the CreateSubjectSite implementation to run the step2 flow,
