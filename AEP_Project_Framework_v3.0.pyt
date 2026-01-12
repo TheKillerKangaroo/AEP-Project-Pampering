@@ -416,6 +416,8 @@ class CreateSubjectSite(object):
         extracted_new = []
         replaced = []
         failed = []
+        # store fallback qurls (and error) for failed layers for post-run diagnostics
+        fallback_qurls_for_failed = []
 
         try:
             default_gdb = aprx.defaultGeodatabase
@@ -455,6 +457,43 @@ class CreateSubjectSite(object):
                         return v
                 return None
 
+            def _fetch_service_metadata(service_url, token=None):
+                """
+                Try a couple of sensible metadata endpoints for the given service URL and return a small dict
+                with a few useful keys (if available). This is optional and best-effort.
+                """
+                try_urls = []
+                base = service_url.rstrip('/')
+                # if URL ends with a numeric layer id, also try the parent service endpoint
+                try:
+                    # parent service endpoint (strip trailing '/<id>' if present)
+                    parent = base.rsplit('/', 1)[0]
+                    try_urls.append(parent + '?f=json')
+                except:
+                    pass
+                try_urls.append(base + '?f=json')
+
+                for mu in try_urls:
+                    murl = mu
+                    if token:
+                        sep = '&' if '?' in murl else '?'
+                        murl = murl + f"&token={token}"
+                    try:
+                        with urllib.request.urlopen(murl, timeout=30) as mresp:
+                            meta = json.loads(mresp.read().decode())
+                            # collect a few helpful fields if present
+                            info = {}
+                            for k in ("serviceDescription", "name", "type", "currentVersion", "supportsQuery", "capabilities", "maxRecordCount"):
+                                if k in meta:
+                                    info[k] = meta[k]
+                            if not info:
+                                # fallback to top-level summary
+                                info = {k: meta.get(k, "") for k in ("name", "type", "serviceDescription")}
+                            return info
+                    except Exception:
+                        continue
+                return None
+
             for idx, feat in enumerate(features, start=1):
                 attrs = feat.get("attributes", {})
                 service_url = _get_attr_ci(attrs, "URL") or _get_attr_ci(attrs, "Url") or _get_attr_ci(attrs, "url")
@@ -470,6 +509,19 @@ class CreateSubjectSite(object):
                     arcpy.AddWarning(f"  - No URL for reference record {short_name}; skipping.")
                     skipped.append(short_name)
                     continue
+
+                # Basic service-type hint (MapServer or FeatureServer)
+                try:
+                    svc_type = None
+                    if "/MapServer" in service_url:
+                        svc_type = "MapServer"
+                    elif "/FeatureServer" in service_url:
+                        svc_type = "FeatureServer"
+                    else:
+                        svc_type = "UnknownServiceType"
+                    arcpy.AddMessage(f"  • Service type hint: {svc_type}")
+                except Exception:
+                    pass
 
                 # Build intended output path early (for quick existence check)
                 fd_path = os.path.join(default_gdb, feature_dataset_name)
@@ -519,6 +571,17 @@ class CreateSubjectSite(object):
                         raise Exception("Layer creation failed; attempting REST fallback")
                 except Exception as sel_err:
                     arcpy.AddWarning(f"  - Selection by location failed for '{short_name}': {sel_err}")
+
+                    # Fetch and print a little service metadata (best-effort) to help debugging
+                    try:
+                        meta = _fetch_service_metadata(service_url, token)
+                        if meta:
+                            arcpy.AddMessage(f"  • Service metadata (best-effort): {meta}")
+                        else:
+                            arcpy.AddMessage("  • No service metadata available (best-effort).")
+                    except Exception:
+                        pass
+
                     # Clean up any partially created layer
                     try:
                         if made_layer:
@@ -528,11 +591,29 @@ class CreateSubjectSite(object):
 
                     # REST fallback: query the service /query endpoint for OBJECTIDs intersecting the buffer geometry
                     try:
-                        # get a single geometry JSON from buffer_fc (esri JSON)
+                        # get a single geometry JSON from buffer_fc (esri JSON) and determine its spatial reference
                         geom_json = None
+                        geom_sr_wkid = 4326
                         with arcpy.da.SearchCursor(buffer_fc, ["SHAPE@"]) as gcur:
                             for grow in gcur:
-                                geom_json = grow[0].JSON
+                                geom_obj = grow[0]
+                                try:
+                                    geom_json = geom_obj.JSON
+                                except:
+                                    geom_json = None
+                                # attempt to derive SR WKID from geometry JSON if present
+                                try:
+                                    if geom_json:
+                                        gj = json.loads(geom_json)
+                                        sr = gj.get("spatialReference") or {}
+                                        geom_sr_wkid = sr.get("wkid") or sr.get("latestWkid") or geom_sr_wkid
+                                except Exception:
+                                    pass
+                                # fallback to geometry object's spatialReference factoryCode/wkid
+                                try:
+                                    geom_sr_wkid = int(getattr(geom_obj.spatialReference, "factoryCode", getattr(geom_obj.spatialReference, "wkid", geom_sr_wkid)))
+                                except Exception:
+                                    pass
                                 break
 
                         if not geom_json:
@@ -544,21 +625,44 @@ class CreateSubjectSite(object):
                             "geometry": geom_json,
                             "geometryType": "esriGeometryPolygon",
                             "spatialRel": "esriSpatialRelIntersects",
-                            "inSR": "4326",
+                            "inSR": str(geom_sr_wkid),
                             "returnIdsOnly": "true",
                             "f": "json"
                         }
                         if token:
                             qparams["token"] = token
 
-                        qurl = f"{query_layer_url}?{urllib.parse.urlencode(qparams)}"
-                        with urllib.request.urlopen(qurl, timeout=60) as qresp:
-                            qdata = json.loads(qresp.read().decode())
+                        # Retry loop for fallback query (3 attempts, short backoff)
+                        object_ids = []
+                        last_err = None
+                        qurl_used = None
+                        for attempt in range(3):
+                            qurl = f"{query_layer_url}?{urllib.parse.urlencode(qparams)}"
+                            qurl_used = qurl
+                            arcpy.AddMessage(f"  - REST fallback query URL (attempt {attempt+1}): {qurl}")
+                            try:
+                                with urllib.request.urlopen(qurl, timeout=120) as qresp:
+                                    qdata = json.loads(qresp.read().decode())
+                                # check for REST error block
+                                if "error" in qdata:
+                                    last_err = qdata["error"]
+                                    arcpy.AddWarning(f"  - REST fallback returned error: {last_err}")
+                                    time.sleep(3)
+                                    continue
+                                object_ids = qdata.get("objectIds") or []
+                                # success if we got object ids
+                                break
+                            except Exception as e:
+                                last_err = e
+                                arcpy.AddWarning(f"  - REST fallback HTTP error on attempt {attempt+1}: {e}")
+                                time.sleep(3)
 
-                        object_ids = qdata.get("objectIds") or []
+                        # store qurl for diagnostics if fallback produced no object ids
                         if not object_ids:
                             arcpy.AddMessage(f"  - REST query returned no features for '{short_name}'; skipping.")
                             failed.append(short_name)
+                            # record the qurl and last error for post-run diagnostics
+                            fallback_qurls_for_failed.append({"shortname": short_name, "qurl": qurl_used, "error": str(last_err)})
                             # ensure no leftover
                             try:
                                 if arcpy.Exists(temp_layer_name):
@@ -583,6 +687,8 @@ class CreateSubjectSite(object):
                                     arcpy.management.Delete(temp_layer_name)
                             except:
                                 pass
+                            # record qurl for diagnostics
+                            fallback_qurls_for_failed.append({"shortname": short_name, "qurl": qurl_used, "error": str(e2)})
                             continue
 
                         # selection with the filtered layer is effectively successful
@@ -596,6 +702,11 @@ class CreateSubjectSite(object):
                         try:
                             if arcpy.Exists(temp_layer_name):
                                 arcpy.management.Delete(temp_layer_name)
+                        except:
+                            pass
+                        # record fallback info for diagnostics if available
+                        try:
+                            fallback_qurls_for_failed.append({"shortname": short_name, "qurl": qurl_used if 'qurl_used' in locals() else None, "error": str(fb_err)})
                         except:
                             pass
                         continue
@@ -712,6 +823,79 @@ class CreateSubjectSite(object):
 
                     arcpy.AddMessage(f"  ✓ Extracted '{short_name}' to {out_fc}")
                     processed_outputs.append({"shortname": short_name, "path": out_fc})
+
+                    # --- NEW: Add the output layer to "Site Details Map" and place it in a group named after the feature dataset ---
+                    try:
+                        # Find or create the "Site Details Map" in the current project
+                        site_map = None
+                        maps = [m for m in aprx.listMaps() if m.name == "Site Details Map"]
+                        if maps:
+                            site_map = maps[0]
+                        else:
+                            try:
+                                # create the map with default type (MAP). Do not pass basemap name as map_type.
+                                site_map = aprx.createMap("Site Details Map")
+                                arcpy.AddMessage("  ✓ Created 'Site Details Map'.")
+                                # Attempt to apply Imagery Hybrid basemap if the API supports it
+                                try:
+                                    site_map.addBasemap("Imagery Hybrid")
+                                    arcpy.AddMessage("  ✓ Applied 'Imagery Hybrid' basemap to 'Site Details Map'.")
+                                except Exception:
+                                    # Not fatal — older runtimes may not support addBasemap or the string name
+                                    arcpy.AddWarning("  - Could not apply 'Imagery Hybrid' basemap programmatically; add it manually if required.")
+                                # Attempt to set the map spatial reference to GDA2020 / NSW Lambert (8058) if supported
+                                try:
+                                    site_map.spatialReference = arcpy.SpatialReference(8058)
+                                    arcpy.AddMessage("  ✓ Set 'Site Details Map' spatial reference to GDA2020 / NSW Lambert (8058).")
+                                except Exception:
+                                    arcpy.AddWarning("  - Could not set spatial reference on 'Site Details Map' programmatically; layers will retain their own spatial references.")
+                            except Exception as cm_err:
+                                arcpy.AddWarning(f"  - Could not create 'Site Details Map': {cm_err}")
+                                site_map = None
+
+                        if site_map:
+                            # Add the feature class to the map
+                            try:
+                                new_layer = site_map.addDataFromPath(out_fc)
+                                # Try to name the layer sensibly
+                                try:
+                                    new_layer.name = short_name
+                                except:
+                                    pass
+
+                                # Find or create a group layer with the feature dataset name
+                                group_layer = None
+                                try:
+                                    for lyr in site_map.listLayers():
+                                        # some Layer objects may not have isGroupLayer attribute in older runtimes; guard with getattr
+                                        if getattr(lyr, "isGroupLayer", False) and lyr.name == feature_dataset_name:
+                                            group_layer = lyr
+                                            break
+                                except Exception:
+                                    # listLayers may fail in some environments; ignore and proceed
+                                    pass
+
+                                if not group_layer:
+                                    # Attempt to create a group layer; APIs vary across Pro versions so guard with try/except
+                                    try:
+                                        group_layer = site_map.createGroupLayer(feature_dataset_name)
+                                        arcpy.AddMessage(f"  ✓ Created group layer '{feature_dataset_name}' in 'Site Details Map'.")
+                                    except Exception as cg_err:
+                                        arcpy.AddWarning(f"  - Could not create group layer '{feature_dataset_name}' programmatically: {cg_err}. Layer will remain at root of map.")
+                                        group_layer = None
+
+                                # If a group layer exists, try to move the newly added layer into it
+                                if group_layer:
+                                    try:
+                                        site_map.addLayerToGroup(group_layer, new_layer)
+                                    except Exception as mg_err:
+                                        arcpy.AddWarning(f"  - Could not move layer '{short_name}' into group '{feature_dataset_name}': {mg_err}")
+                                # else leave at root
+                            except Exception as add_err:
+                                arcpy.AddWarning(f"  - Could not add '{out_fc}' to 'Site Details Map': {add_err}")
+                    except Exception as map_err:
+                        arcpy.AddWarning(f"  - Error while attempting to add layer to 'Site Details Map': {map_err}")
+                    # --- END NEW SECTION ---
 
                 except Exception as e:
                     arcpy.AddWarning(f"  - Could not move temporary extract to final location for '{short_name}': {e}")
@@ -904,6 +1088,13 @@ class CreateSubjectSite(object):
             arcpy.AddMessage(f"  - Failed layers: {len(failed)}")
             if failed:
                 arcpy.AddMessage(f"    {failed}")
+
+            # Post-run diagnostic: print fallback qurls used for failed layers (if any)
+            if fallback_qurls_for_failed:
+                arcpy.AddMessage("\nFallback REST queries used for failed layers (for debugging):")
+                for item in fallback_qurls_for_failed:
+                    arcpy.AddMessage(f"  - Layer: {item.get('shortname')}  |  qurl: {item.get('qurl')}  |  error: {item.get('error')}")
+                arcpy.AddMessage("Tip: Copy the qurl into a browser or curl to inspect the service response.")
 
             # FUNKY final summary block for Step 2
             arcpy.AddMessage("\n" + ("✨" * 12))
