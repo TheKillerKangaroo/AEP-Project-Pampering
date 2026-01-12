@@ -282,9 +282,9 @@ class CreateSubjectSite(object):
                         target_lyr.name = f"Project Study Area {project_number}"
                         
                         if target_lyr.supports("DEFINITIONQUERY"):
-                            dq = f"project_number = '{project_number}'"
+                            dq = f"project_number = '{project_number}' AND EndDate IS Not Null"
                             target_lyr.definitionQuery = dq
-                            arcpy.AddMessage(f"✓ Layer renamed and filtered to project {project_number}")
+                            arcpy.AddMessage(f"✓ Layer renamed and filtered to project {project_number} AND EndDate IS Not Null")
                 else:
                     arcpy.AddWarning("Map or Layer File not found. Layer not added to map.")
             except Exception as e:
