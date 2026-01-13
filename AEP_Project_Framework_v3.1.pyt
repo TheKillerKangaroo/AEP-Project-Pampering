@@ -384,25 +384,33 @@ class CreateSubjectSite(object):
         # try to update connection properties on style_layer
         if conn_props:
             try:
-                # Only call updateConnectionProperties if supported by the layer object
+                # Prefer calling updateConnectionProperties when available; otherwise fall back to applying symbology.
                 update_func = getattr(style_layer, "updateConnectionProperties", None)
                 style_conn_props = getattr(style_layer, "connectionProperties", None)
                 if callable(update_func) and style_conn_props is not None:
                     try:
                         update_func(style_conn_props, conn_props)
                         update_ok = True
-                    except Exception as e:
-                        arcpy.AddWarning(f"  - updateConnectionProperties failed for '{style_path}': {e}\n{traceback.format_exc()}")
-                        # attempt ApplySymbologyFromLayer fallback on the imported style layer
+                    except AttributeError as ae:
+                        # Common case where the method isn't supported by this object/runtime
+                        arcpy.AddMessage(f"  - updateConnectionProperties not supported by this layer object: {ae}")
+                        # fallback to ApplySymbologyFromLayer without printing a full traceback
                         try:
                             arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
                             update_ok = True
-                            arcpy.AddMessage(f"  • Applied symbology to imported style layer via ApplySymbologyFromLayer as workaround.")
+                            arcpy.AddMessage("  • Applied symbology to imported style layer via ApplySymbologyFromLayer (fallback).")
                         except Exception as e2:
-                            arcpy.AddWarning(f"  - ApplySymbologyFromLayer on imported style also failed: {e2}\n{traceback.format_exc()}")
+                            arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback failed: {e2}")
+                    except Exception as e:
+                        arcpy.AddWarning(f"  - updateConnectionProperties failed: {e}")
+                        try:
+                            arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
+                            update_ok = True
+                            arcpy.AddMessage("  • Applied symbology to imported style layer via ApplySymbologyFromLayer (fallback).")
+                        except Exception as e2:
+                            arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback failed: {e2}")
                 else:
-                    # The imported style layer object doesn't expose updateConnectionProperties or lacks connectionProperties.
-                    arcpy.AddMessage(f"  - updateConnectionProperties not available on imported style; attempting ApplySymbologyFromLayer fallback.")
+                    arcpy.AddMessage("  - updateConnectionProperties not available on imported style; attempting ApplySymbologyFromLayer fallback.")
                     try:
                         arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
                         update_ok = True
@@ -410,7 +418,7 @@ class CreateSubjectSite(object):
                     except Exception as e2:
                         arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback also failed: {e2}\n{traceback.format_exc()}")
             except Exception as e:
-                arcpy.AddWarning(f"  - Error while attempting connection update/fallback for '{style_path}': {e}\n{traceback.format_exc()}")
+                arcpy.AddWarning(f"  - Error while attempting connection update/fallback for '{style_path}': {e}")
 
         # restore def query from data_layer (or provided)
         try:
@@ -893,7 +901,7 @@ class CreateSubjectSite(object):
                                     applied = True
                                     arcpy.AddMessage("  ✓ Applied standard Study Area symbology to PSA by swapping.")
                                 else:
-                                    # fallback to ApplySymbologyFromLayer on the layer we added
+                                    # fallback to ApplySymbologyFromLayer on the data layer
                                     try:
                                         arcpy.management.ApplySymbologyFromLayer(psa_layer_obj, LAYERFILE_PATH)
                                         final_psa = psa_layer_obj
