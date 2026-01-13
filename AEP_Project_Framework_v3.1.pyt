@@ -1,4 +1,15 @@
 # -*- coding: utf-8 -*-
+#  $$\   $$\ $$\ $$\ $$\                           $$\   $$\                                                                      
+#  $$ | $$  |\__|$$ |$$ |                          $$ | $$  |                                                                     
+#  $$ |$$  / $$\ $$ |$$ | $$$$$$\   $$$$$$\        $$ |$$  / $$$$$$\  $$$$$$$\   $$$$$$\   $$$$$$\   $$$$$$\   $$$$$$\   $$$$$$\  
+#  $$$$$  /  $$ |$$ |$$ |$$  __$$\ $$  __$$\       $$$$$  /  \____$$\ $$  __$$\ $$  __$$\  \____$$\ $$  __$$\ $$  __$$\ $$  __$$\ 
+#  $$  $$<   $$ |$$ |$$ |$$$$$$$$ |$$ |  \__|      $$  $$<   $$$$$$$ |$$ |  $$ |$$ /  $$ | $$$$$$$ |$$ |  \__|$$ /  $$ |$$ /  $$ |
+#  $$ |\$$\  $$ |$$ |$$ |$$   ____|$$ |            $$ |\$$\ $$  __$$ |$$ |  $$ |$$ |  $$ |$$  __$$ |$$ |      $$ |  $$ |$$ |  $$ |
+#  $$ | \$$\ $$ |$$ |$$ |\$$$$$$$\ $$ |            $$ | \$$\\$$$$$$$ |$$ |  $$ |\$$$$$$$ |\$$$$$$$ |$$ |      \$$$$$$  |\$$$$$$  |
+#  \__|  \__|\__|\__|\__| \_______|\__|            \__|  \__|\_______|\__|  \__| \____$$ | \_______|\__|       \______/  \______/ 
+                                                                             $$\   $$ |                                        
+                                                                             \$$$$$$  |                                        
+                                                                              \______/                                         
 """
                                                                                                     
                                                                                                     
@@ -33,6 +44,7 @@ import urllib.parse
 from datetime import datetime
 import time
 import re
+import uuid
 
 # Global Path to Layer File (Standard Styling)
 LAYERFILE_PATH = r"G:\Shared drives\99.3 GIS Admin\Production\Layer Files\AEP - Study Area.lyrx"
@@ -465,9 +477,24 @@ class CreateSubjectSite(object):
         matched_address = ""
         area_ha = 0.0
 
+        # track temp paths created in this routine for cleanup
+        created_temp_paths = set()
+        removed_temp_paths = []
+        failed_temp_deletes = []
+
+        run_uuid = str(uuid.uuid4())[:8]
+
         try:
             aprx = arcpy.mp.ArcGISProject("CURRENT")
             default_gdb = aprx.defaultGeodatabase
+            # record initial workspace so we can restore later if needed
+            prior_workspace = None
+            try:
+                prior_workspace = arcpy.env.workspace
+                arcpy.env.workspace = default_gdb
+            except Exception:
+                pass
+
             arcpy.env.workspace = default_gdb
 
             # 1. Geocode
@@ -499,15 +526,16 @@ class CreateSubjectSite(object):
 
             # Create point
             geocoded_point = arcpy.PointGeometry(arcpy.Point(loc['x'], loc['y']), arcpy.SpatialReference(4326))
-            temp_geocoded = os.path.join("memory", "geocoded_point")
+            temp_geocoded = os.path.join("memory", f"geocoded_point_{run_uuid}")
             arcpy.management.CopyFeatures(geocoded_point, temp_geocoded)
+            created_temp_paths.add(temp_geocoded)
 
             arcpy.AddMessage(f"Located at: {loc['x']:.5f}, {loc['y']:.5f}")
 
             # 2. Select property polygon (Cadastre)
             property_service_url = "https://portal.spatial.nsw.gov.au/server/rest/services/NSW_Land_Parcel_Property_Theme/FeatureServer/12"
 
-            temp_property_layer = "temp_property_layer"
+            temp_property_layer = f"temp_property_layer_{run_uuid}"
             arcpy.management.MakeFeatureLayer(property_service_url, temp_property_layer)
 
             arcpy.AddMessage("Selecting property parcel...")
@@ -524,16 +552,17 @@ class CreateSubjectSite(object):
                     layer_sr = getattr(desc, "spatialReference", None)
 
                     # create a copy of the geocoded point and project to the layer SR if needed
-                    pt_in = os.path.join("memory", "temp_geocode_copy")
+                    pt_in = os.path.join("memory", f"temp_geocode_copy_{run_uuid}")
                     if arcpy.Exists(pt_in):
                         try: arcpy.management.Delete(pt_in)
                         except: pass
                     arcpy.management.CopyFeatures(temp_geocoded, pt_in)
+                    created_temp_paths.add(pt_in)
 
                     proj_pt = pt_in
                     if layer_sr and getattr(layer_sr, "factoryCode", None) and layer_sr.factoryCode != 4326:
                         # project into cadastre SR in memory
-                        proj_pt = os.path.join("memory", "temp_geocode_proj")
+                        proj_pt = os.path.join("memory", f"temp_geocode_proj_{run_uuid}")
                         try:
                             if arcpy.Exists(proj_pt):
                                 try: arcpy.management.Delete(proj_pt)
@@ -542,19 +571,21 @@ class CreateSubjectSite(object):
                         except Exception:
                             # if project fails, continue with original pt_in
                             proj_pt = pt_in
+                        created_temp_paths.add(proj_pt)
 
                     # buffer the point a small distance (2 metres) using GEODESIC for safety
-                    buf_fc = os.path.join("memory", "temp_geocode_buf")
+                    buf_fc = os.path.join("memory", f"temp_geocode_buf_{run_uuid}")
                     if arcpy.Exists(buf_fc):
                         try: arcpy.management.Delete(buf_fc)
                         except: pass
                     arcpy.analysis.Buffer(proj_pt, buf_fc, "2 Meters", method="GEODESIC")
+                    created_temp_paths.add(buf_fc)
 
                     # try INTERSECT using the small buffer
                     arcpy.management.SelectLayerByLocation(temp_property_layer, "INTERSECT", buf_fc)
                     property_count = int(arcpy.management.GetCount(temp_property_layer).getOutput(0))
 
-                    # cleanup memory fcs (best-effort)
+                    # cleanup memory fcs (best-effort) - we'll clean up at the end too
                     try: arcpy.management.Delete(pt_in)
                     except: pass
                     try: arcpy.management.Delete(proj_pt)
@@ -574,21 +605,31 @@ class CreateSubjectSite(object):
                     return
 
             # Copy selection to local GDB
-            temp_property = os.path.join(default_gdb, "temp_property")
+            temp_property = os.path.join(default_gdb, f"temp_property_{run_uuid}")
             if arcpy.Exists(temp_property):
                 arcpy.management.Delete(temp_property)
-
             arcpy.management.CopyFeatures(temp_property_layer, temp_property)
-            arcpy.management.Delete(temp_property_layer)
-            arcpy.management.Delete(temp_geocoded)
+            created_temp_paths.add(temp_property)
+
+            try:
+                arcpy.management.Delete(temp_property_layer)
+            except:
+                pass
+            try:
+                arcpy.management.Delete(temp_geocoded)
+                if temp_geocoded in created_temp_paths:
+                    created_temp_paths.discard(temp_geocoded)
+                    removed_temp_paths.append(temp_geocoded)
+            except:
+                pass
 
             arcpy.management.RepairGeometry(temp_property, "DELETE_NULL")
 
             # Handle multi-polygon properties
             if property_count > 1:
                 # Try dissolving in memory first to avoid file GDB locks
-                dissolved_mem = os.path.join("in_memory", "temp_dissolved")
-                dissolved_gdb = os.path.join(default_gdb, "temp_dissolved")
+                dissolved_mem = os.path.join("in_memory", f"temp_dissolved_{run_uuid}")
+                dissolved_gdb = os.path.join(default_gdb, f"temp_dissolved_{run_uuid}")
                 try:
                     # ensure no leftover in memory
                     if arcpy.Exists(dissolved_mem):
@@ -607,6 +648,7 @@ class CreateSubjectSite(object):
                         except:
                             pass
                     arcpy.management.CopyFeatures(dissolved_mem, dissolved_gdb)
+                    created_temp_paths.add(dissolved_gdb)
 
                     # set working_fc to the persistent copy in the default gdb
                     working_fc = dissolved_gdb
@@ -627,11 +669,12 @@ class CreateSubjectSite(object):
                         pass
 
                     # attempt a dissolve into a timestamped gdb FC to reduce name collisions/locks
-                    alt_name = f"temp_dissolved_{int(time.time())}"
+                    alt_name = f"temp_dissolved_{int(time.time())}_{run_uuid}"
                     alt_dissolved = os.path.join(default_gdb, alt_name)
                     try:
                         arcpy.management.Dissolve(temp_property, alt_dissolved, multi_part="MULTI_PART")
                         working_fc = alt_dissolved
+                        created_temp_paths.add(alt_dissolved)
                     except Exception as e2:
                         # If this still fails, surface a clear error for debugging
                         arcpy.AddError(f"Could not perform Dissolve (tried memory and file gdb): {e2}")
@@ -678,7 +721,7 @@ class CreateSubjectSite(object):
             # Before appending: check the target feature service for existing active records for this project number and archive them by setting EndDate.
             try:
                 arcpy.AddMessage("Checking target feature service for existing active project records (EndDate IS NULL)...")
-                temp_target_layer = "temp_target_layer"
+                temp_target_layer = f"temp_target_layer_{run_uuid}"
                 # Make a layer from the feature service (layer URL)
                 arcpy.management.MakeFeatureLayer(target_layer_url, temp_target_layer)
                 # Build a WHERE clause that respects the layer field types
@@ -716,18 +759,61 @@ class CreateSubjectSite(object):
                 arcpy.AddError(f"Failed to append to feature service: {e}")
                 appended_success = False
 
-            # 5. Clean up intermediate fc (we keep working_fc for further processing if it's in default gdb)
-            # Note: working_fc is already in default_gdb (temp_property or temp_dissolved)
+            # 5. Prefer authoritative service record for downstream processing and map display
+            study_area_for_step2 = working_fc
+            try:
+                if appended_success:
+                    # Create a temporary layer from the service and select the active feature for the project
+                    temp_service_layer_name = f"temp_postappend_service_layer_{run_uuid}"
+                    try:
+                        if arcpy.Exists(temp_service_layer_name):
+                            try:
+                                arcpy.management.Delete(temp_service_layer_name)
+                            except:
+                                pass
+                        arcpy.management.MakeFeatureLayer(target_layer_url, temp_service_layer_name)
+                        where_clause = build_project_defq(project_number, layer=temp_service_layer_name)
+                        arcpy.management.SelectLayerByAttribute(temp_service_layer_name, "NEW_SELECTION", where_clause)
+                        sel_count = int(arcpy.management.GetCount(temp_service_layer_name).getOutput(0))
+                        if sel_count > 0:
+                            study_area_mem = os.path.join("memory", f"study_area_{project_number}_{run_uuid}")
+                            if arcpy.Exists(study_area_mem):
+                                try:
+                                    arcpy.management.Delete(study_area_mem)
+                                except:
+                                    pass
+                            arcpy.management.CopyFeatures(temp_service_layer_name, study_area_mem)
+                            study_area_for_step2 = study_area_mem
+                            created_temp_paths.add(study_area_mem)
+                        else:
+                            # Fallback: use local working_fc if we couldn't find the service record
+                            study_area_for_step2 = working_fc
+                    finally:
+                        try:
+                            arcpy.management.Delete(temp_service_layer_name)
+                        except:
+                            pass
+            except Exception:
+                # In case anything fails, fall back to working_fc
+                study_area_for_step2 = working_fc
+
             # 6. Add to Map (No Zoom)
             try:
                 map_obj = aprx.activeMap
                 if map_obj:
-                    # We'll use a single-final-layer approach consistent with HeadmasterStyles:
+                    # Prefer to add the feature service layer (authoritative) to the map so it stays connected to the service,
+                    # rather than adding the temporary local table (temp_dissolved) which causes confusion / incorrect connections.
                     try:
-                        # Add the layer (PSA) to the map
-                        psa_layer = map_obj.addDataFromPath(working_fc)
+                        # Attempt to add the service layer to the map (service URL)
+                        psa_layer_added = None
+                        if appended_success:
+                            psa_layer_added = map_obj.addDataFromPath(target_layer_url)
+                        else:
+                            # Append failed - fall back to adding the local working_fc
+                            psa_layer_added = map_obj.addDataFromPath(working_fc)
+
                         # Normalise returned object
-                        top, child, parent = self._normalize_added(psa_layer)
+                        top, child, parent = self._normalize_added(psa_layer_added)
                         psa_layer_obj = child or top
                         try:
                             psa_layer_obj.name = f"Project Study Area {project_number}"
@@ -738,22 +824,36 @@ class CreateSubjectSite(object):
                         final_psa = None
                         if os.path.exists(LAYERFILE_PATH):
                             applied = False
-                            # Try swap (pass layer-aware definition query built using psa_layer_obj)
-                            dq_for_psa = build_project_defq(project_number, layer=psa_layer_obj)
-                            final = self._apply_style_swap(map_obj, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=dq_for_psa)
-                            if final is not None:
-                                final_psa = final
-                                applied = True
-                                arcpy.AddMessage("  ✓ Applied standard Study Area symbology to PSA by swapping.")
-                            else:
-                                # fallback to ApplySymbologyFromLayer on the data layer
+                            # If we added the service layer, use its connectionProperties so the style points to the service
+                            try:
+                                if psa_layer_obj and getattr(psa_layer_obj, "connectionProperties", None):
+                                    conn_source_layer = psa_layer_obj
+                                else:
+                                    # fallback: use the original data layer object if available
+                                    conn_source_layer = psa_layer_obj
+
+                                dq_for_psa = None
                                 try:
-                                    arcpy.management.ApplySymbologyFromLayer(psa_layer_obj, LAYERFILE_PATH)
-                                    final_psa = psa_layer_obj
+                                    dq_for_psa = build_project_defq(project_number, layer=psa_layer_obj)
+                                except:
+                                    dq_for_psa = build_project_defq(project_number)
+
+                                final = self._apply_style_swap(map_obj, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=dq_for_psa)
+                                if final is not None:
+                                    final_psa = final
                                     applied = True
-                                    arcpy.AddMessage("  ✓ Applied standard Study Area symbology using ApplySymbologyFromLayer.")
-                                except Exception as e_sym:
-                                    arcpy.AddWarning(f"  - Could not apply standard symbology to Project Study Area: {e_sym}")
+                                    arcpy.AddMessage("  ✓ Applied standard Study Area symbology to PSA by swapping.")
+                                else:
+                                    # fallback to ApplySymbologyFromLayer on the data layer
+                                    try:
+                                        arcpy.management.ApplySymbologyFromLayer(psa_layer_obj, LAYERFILE_PATH)
+                                        final_psa = psa_layer_obj
+                                        applied = True
+                                        arcpy.AddMessage("  ✓ Applied standard Study Area symbology using ApplySymbologyFromLayer.")
+                                    except Exception as e_sym:
+                                        arcpy.AddWarning(f"  - Could not apply standard symbology to Project Study Area: {e_sym}")
+                            except Exception as e:
+                                arcpy.AddWarning(f"  - Error while attempting to apply style to PSA: {e}")
 
                             # ensure definition query is applied using layer-aware builder
                             try:
@@ -772,13 +872,101 @@ class CreateSubjectSite(object):
             except Exception as e:
                 arcpy.AddWarning(f"Could not update map: {str(e)}")
 
+            # After adding to service and map: perform stricter cleanup of temporary local copies that are purely transient
+            try:
+                arcpy.AddMessage("Cleaning up temporary data created during Step 1...")
+                # Protect the study_area_for_step2 from deletion
+                protected = set()
+                try:
+                    if study_area_for_step2:
+                        protected.add(os.path.normpath(study_area_for_step2))
+                except Exception:
+                    pass
+
+                for p in list(created_temp_paths):
+                    try:
+                        normp = os.path.normpath(p)
+                    except Exception:
+                        normp = p
+                    if normp in protected:
+                        continue
+                    try:
+                        if arcpy.Exists(p):
+                            arcpy.management.Delete(p)
+                            removed_temp_paths.append(p)
+                        else:
+                            # If it was an in-memory name already deleted earlier, still consider it removed
+                            removed_temp_paths.append(p)
+                    except Exception as delerr:
+                        failed_temp_deletes.append({"path": p, "error": str(delerr)})
+                        # continue cleaning other items
+                        continue
+
+                # Additionally: scan default gdb for loose temp FCs/tables matching known prefixes and remove them.
+                prefixes = ("temp_", "tmp_extract_", "temp_dissolved_", "alt_dissolved_", f"temp_property_{run_uuid}", f"tmp_extract_")
+                try:
+                    prev_ws = arcpy.env.workspace
+                    arcpy.env.workspace = default_gdb
+                    # Feature classes
+                    fc_list = arcpy.ListFeatureClasses() or []
+                    for fc in fc_list:
+                        try:
+                            if any(fc.lower().startswith(pref.lower()) for pref in prefixes):
+                                full = os.path.join(default_gdb, fc)
+                                # don't delete protected path
+                                if os.path.normpath(full) in protected:
+                                    continue
+                                try:
+                                    arcpy.management.Delete(full)
+                                    removed_temp_paths.append(full)
+                                except Exception as e_del:
+                                    failed_temp_deletes.append({"path": full, "error": str(e_del)})
+                        except Exception:
+                            pass
+                    # Tables
+                    tbls = arcpy.ListTables() or []
+                    for tbl in tbls:
+                        try:
+                            if any(tbl.lower().startswith(pref.lower()) for pref in prefixes):
+                                full = os.path.join(default_gdb, tbl)
+                                if os.path.normpath(full) in protected:
+                                    continue
+                                try:
+                                    arcpy.management.Delete(full)
+                                    removed_temp_paths.append(full)
+                                except Exception as e_del:
+                                    failed_temp_deletes.append({"path": full, "error": str(e_del)})
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        arcpy.env.workspace = prior_workspace
+                    except Exception:
+                        pass
+
+                # Report cleanup results
+                if removed_temp_paths:
+                    arcpy.AddMessage("Temporary data removed:")
+                    for r in removed_temp_paths:
+                        arcpy.AddMessage(f"  - {r}")
+                if failed_temp_deletes:
+                    arcpy.AddWarning("Some temporary items could not be deleted (see details):")
+                    for fi in failed_temp_deletes:
+                        arcpy.AddWarning(f"  - {fi.get('path')}: {fi.get('error')}")
+            except Exception as e:
+                arcpy.AddWarning(f"Cleanup during Step 1 encountered errors: {e}")
+
             arcpy.AddMessage("\nSTEP 1 COMPLETE.")
 
             # Continue to Step 2 using the study area we just created if user requested it
             if run_step2_flag:
                 arcpy.AddMessage("Proceeding to STEP 2 using the created study area...")
                 try:
-                    self._run_step2_with_study_area(aprx, working_fc, project_number, overwrite_flag, force_requery)
+                    # Pass the in-memory copy of the appended service feature where possible so Step 2 operates on the authoritative geometry,
+                    # and so the script is not accidentally connected to the temporary default-gdb table like temp_dissolved.
+                    self._run_step2_with_study_area(aprx, study_area_for_step2, project_number, overwrite_flag, force_requery)
                 except Exception as e:
                     arcpy.AddError(f"Error while running Step 2 after Step 1: {e}")
             else:
@@ -855,6 +1043,11 @@ class CreateSubjectSite(object):
         failed = []
         # store fallback qurls (and error) for failed layers for post-run diagnostics
         fallback_qurls_for_failed = []
+
+        # Track temporary items created by Step 2 for cleanup
+        step2_created_temp = set()
+        step2_removed = []
+        step2_failed_deletes = []
 
         try:
             default_gdb = aprx.defaultGeodatabase
@@ -1080,10 +1273,11 @@ class CreateSubjectSite(object):
                     distance_m = 0.0
 
                 if distance_m > 0:
-                    buffer_fc = os.path.join("memory", f"buf_{safe_short}")
+                    buffer_fc = os.path.join("memory", f"buf_{safe_short}_{int(time.time())}")
                     if arcpy.Exists(buffer_fc):
                         arcpy.management.Delete(buffer_fc)
                     arcpy.analysis.Buffer(study_area_fc, buffer_fc, f"{distance_m} Meters", method="GEODESIC")
+                    step2_created_temp.add(buffer_fc)
                 else:
                     buffer_fc = study_area_fc
 
@@ -1094,6 +1288,7 @@ class CreateSubjectSite(object):
                     # Try the normal approach first
                     arcpy.management.MakeFeatureLayer(service_url, temp_layer_name)
                     made_layer = True
+                    step2_created_temp.add(temp_layer_name)
                 except Exception as e:
                     arcpy.AddWarning(f"  - Could not make feature layer from URL '{service_url}': {e}")
                     # we'll try the REST fallback below
@@ -1123,6 +1318,8 @@ class CreateSubjectSite(object):
                     try:
                         if made_layer:
                             arcpy.management.Delete(temp_layer_name)
+                            if temp_layer_name in step2_created_temp:
+                                step2_created_temp.discard(temp_layer_name)
                     except:
                         pass
 
@@ -1227,6 +1424,8 @@ class CreateSubjectSite(object):
                             try:
                                 if arcpy.Exists(temp_layer_name):
                                     arcpy.management.Delete(temp_layer_name)
+                                    if temp_layer_name in step2_created_temp:
+                                        step2_created_temp.discard(temp_layer_name)
                             except:
                                 pass
                             continue
@@ -1238,6 +1437,7 @@ class CreateSubjectSite(object):
                         where_ids = f"{oid_field} IN ({id_list})"
                         try:
                             arcpy.management.MakeFeatureLayer(service_url, temp_layer_name, where_clause=where_ids)
+                            step2_created_temp.add(temp_layer_name)
                         except Exception as e2:
                             arcpy.AddWarning(f"  - Could not create filtered layer from service for '{short_name}': {e2}")
                             failed.append(short_name)
@@ -1245,6 +1445,8 @@ class CreateSubjectSite(object):
                             try:
                                 if arcpy.Exists(temp_layer_name):
                                     arcpy.management.Delete(temp_layer_name)
+                                    if temp_layer_name in step2_created_temp:
+                                        step2_created_temp.discard(temp_layer_name)
                             except:
                                 pass
                             # record qurl for diagnostics
@@ -1262,6 +1464,8 @@ class CreateSubjectSite(object):
                         try:
                             if arcpy.Exists(temp_layer_name):
                                 arcpy.management.Delete(temp_layer_name)
+                                if temp_layer_name in step2_created_temp:
+                                    step2_created_temp.discard(temp_layer_name)
                         except:
                             pass
                         # record fallback info for diagnostics if available
@@ -1277,10 +1481,17 @@ class CreateSubjectSite(object):
                     try:
                         if arcpy.Exists(temp_layer_name):
                             arcpy.management.Delete(temp_layer_name)
+                            if temp_layer_name in step2_created_temp:
+                                step2_created_temp.discard(temp_layer_name)
                     except:
                         pass
                     if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
-                        arcpy.management.Delete(buffer_fc)
+                        try:
+                            arcpy.management.Delete(buffer_fc)
+                            if buffer_fc in step2_created_temp:
+                                step2_created_temp.discard(buffer_fc)
+                        except:
+                            pass
                     failed.append(short_name)
                     continue
 
@@ -1291,10 +1502,17 @@ class CreateSubjectSite(object):
                     arcpy.AddMessage(f"  - No features selected for '{short_name}', skipping.")
                     try:
                         arcpy.management.Delete(temp_layer_name)
+                        if temp_layer_name in step2_created_temp:
+                            step2_created_temp.discard(temp_layer_name)
                     except:
                         pass
                     if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
-                        arcpy.management.Delete(buffer_fc)
+                        try:
+                            arcpy.management.Delete(buffer_fc)
+                            if buffer_fc in step2_created_temp:
+                                step2_created_temp.discard(buffer_fc)
+                        except:
+                            pass
                     skipped.append(short_name)
                     continue
 
@@ -1305,7 +1523,7 @@ class CreateSubjectSite(object):
 
                 # Write to a temporary output first (in default_gdb) then replace existing only on success
                 timestamp = int(time.time())
-                tmp_out = os.path.join(default_gdb, f"tmp_extract_{safe_short}_{timestamp}")
+                tmp_out = os.path.join(default_gdb, f"tmp_extract_{safe_short}_{timestamp}_{uuid.uuid4().hex[:6]}")
                 try:
                     if buffer_action and buffer_action.strip().upper() == "CLIP":
                         # Clip to buffer -> write to tmp_out
@@ -1313,19 +1531,29 @@ class CreateSubjectSite(object):
                     else:
                         # INTERSECT behavior: copy the selected features as-is to tmp_out
                         arcpy.management.CopyFeatures(temp_layer_name, tmp_out)
+                    step2_created_temp.add(tmp_out)
                 except Exception as e:
                     arcpy.AddWarning(f"  - Error extracting features for '{short_name}': {e}")
                     try:
                         arcpy.management.Delete(temp_layer_name)
+                        if temp_layer_name in step2_created_temp:
+                            step2_created_temp.discard(temp_layer_name)
                     except:
                         pass
                     if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
-                        arcpy.management.Delete(buffer_fc)
+                        try:
+                            arcpy.management.Delete(buffer_fc)
+                            if buffer_fc in step2_created_temp:
+                                step2_created_temp.discard(buffer_fc)
+                        except:
+                            pass
                     failed.append(short_name)
                     # Clean up tmp_out if partially created
                     try:
                         if arcpy.Exists(tmp_out):
                             arcpy.management.Delete(tmp_out)
+                            if tmp_out in step2_created_temp:
+                                step2_created_temp.discard(tmp_out)
                     except:
                         pass
                     continue
@@ -1358,15 +1586,24 @@ class CreateSubjectSite(object):
                             # cleanup tmp_out and move on
                             try:
                                 arcpy.management.Delete(tmp_out)
+                                if tmp_out in step2_created_temp:
+                                    step2_created_temp.discard(tmp_out)
                             except:
                                 pass
                             failed.append(short_name)
                             try:
                                 arcpy.management.Delete(temp_layer_name)
+                                if temp_layer_name in step2_created_temp:
+                                    step2_created_temp.discard(temp_layer_name)
                             except:
                                 pass
                             if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
-                                arcpy.management.Delete(buffer_fc)
+                                try:
+                                    arcpy.management.Delete(buffer_fc)
+                                    if buffer_fc in step2_created_temp:
+                                        step2_created_temp.discard(buffer_fc)
+                                except:
+                                    pass
                             continue
 
                         replaced.append(short_name)
@@ -1378,6 +1615,9 @@ class CreateSubjectSite(object):
                     # Remove tmp_out
                     try:
                         arcpy.management.Delete(tmp_out)
+                        if tmp_out in step2_created_temp:
+                            step2_created_temp.discard(tmp_out)
+                        step2_removed.append(tmp_out)
                     except:
                         pass
 
@@ -1459,26 +1699,37 @@ class CreateSubjectSite(object):
                     try:
                         if arcpy.Exists(tmp_out):
                             arcpy.management.Delete(tmp_out)
+                            if tmp_out in step2_created_temp:
+                                step2_created_temp.discard(tmp_out)
                     except:
                         pass
                     try:
                         arcpy.management.Delete(temp_layer_name)
+                        if temp_layer_name in step2_created_temp:
+                            step2_created_temp.discard(temp_layer_name)
                     except:
                         pass
                     if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
-                        arcpy.management.Delete(buffer_fc)
+                        try:
+                            arcpy.management.Delete(buffer_fc)
+                            if buffer_fc in step2_created_temp:
+                                step2_created_temp.discard(buffer_fc)
+                        except:
+                            pass
                     continue
 
-                # cleanup
+                # cleanup per-record temporary items
                 try:
-                    arcpy.management.Delete(temp_layer_name)
+                    if arcpy.Exists(temp_layer_name):
+                        arcpy.management.Delete(temp_layer_name)
+                        if temp_layer_name in step2_created_temp:
+                            step2_created_temp.discard(temp_layer_name)
+                    if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
+                        arcpy.management.Delete(buffer_fc)
+                        if buffer_fc in step2_created_temp:
+                            step2_created_temp.discard(buffer_fc)
                 except:
                     pass
-                if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
-                    try:
-                        arcpy.management.Delete(buffer_fc)
-                    except:
-                        pass
 
             # 4. Create the SiteLotsReport table in default GDB
             arcpy.AddMessage("Creating SiteLotsReport table...")
@@ -1492,9 +1743,10 @@ class CreateSubjectSite(object):
                 arcpy.AddWarning("Could not find a 'Lots' layer among processed outputs to build SiteLotsReport. Skipping SiteLotsReport.")
             else:
                 arcpy.AddMessage(f"  - Using Lots layer at {lots_fc}")
-                lots_layer = "temp_lots_layer"
+                lots_layer = f"temp_lots_layer_{uuid.uuid4().hex[:6]}"
                 try:
                     arcpy.management.MakeFeatureLayer(lots_fc, lots_layer)
+                    step2_created_temp.add(lots_layer)
                     arcpy.management.SelectLayerByLocation(lots_layer, "WITHIN", study_area_fc)
                     selected_count = int(arcpy.management.GetCount(lots_layer).getOutput(0))
                     arcpy.AddMessage(f"  - {selected_count} lots within subject site.")
@@ -1560,7 +1812,10 @@ class CreateSubjectSite(object):
                     arcpy.AddWarning(f"  - Error creating SiteLotsReport: {e}")
                 finally:
                     try:
-                        arcpy.management.Delete(lots_layer)
+                        if arcpy.Exists(lots_layer):
+                            arcpy.management.Delete(lots_layer)
+                            if lots_layer in step2_created_temp:
+                                step2_created_temp.discard(lots_layer)
                     except:
                         pass
 
@@ -1650,6 +1905,73 @@ class CreateSubjectSite(object):
                 for item in fallback_qurls_for_failed:
                     arcpy.AddMessage(f"  - Layer: {item.get('shortname')}  |  qurl: {item.get('qurl')}  |  error: {item.get('error')}")
                 arcpy.AddMessage("Tip: Copy the qurl into a browser or curl to inspect the service response.")
+
+            # Step 2: stricter cleanup of temp items created during this step
+            try:
+                arcpy.AddMessage("Cleaning up temporary data created during Step 2...")
+                # remove any in-memory or local temps we tracked
+                for t in list(step2_created_temp):
+                    try:
+                        if arcpy.Exists(t):
+                            arcpy.management.Delete(t)
+                            step2_removed.append(t)
+                        else:
+                            # layer names may not be "exists" addressable; still consider them removed
+                            step2_removed.append(t)
+                    except Exception as e:
+                        step2_failed_deletes.append({"path": t, "error": str(e)})
+                        continue
+
+                # Additionally remove leftovers in default_gdb with known prefixes (careful not to remove final outputs)
+                prefixes = ("tmp_extract_", "temp_dissolved_", "temp_property_", "tmp_", "temp_")
+                try:
+                    prev_ws = arcpy.env.workspace
+                    arcpy.env.workspace = default_gdb
+                    fc_list = arcpy.ListFeatureClasses() or []
+                    for fc in fc_list:
+                        try:
+                            if any(fc.lower().startswith(pref.lower()) for pref in prefixes):
+                                full = os.path.join(default_gdb, fc)
+                                # do not remove outputs we added
+                                if any(full == po["path"] for po in processed_outputs):
+                                    continue
+                                try:
+                                    arcpy.management.Delete(full)
+                                    step2_removed.append(full)
+                                except Exception as e_del:
+                                    step2_failed_deletes.append({"path": full, "error": str(e_del)})
+                        except Exception:
+                            pass
+                    tbls = arcpy.ListTables() or []
+                    for tbl in tbls:
+                        try:
+                            if any(tbl.lower().startswith(pref.lower()) for pref in prefixes):
+                                full = os.path.join(default_gdb, tbl)
+                                try:
+                                    arcpy.management.Delete(full)
+                                    step2_removed.append(full)
+                                except Exception as e_del:
+                                    step2_failed_deletes.append({"path": full, "error": str(e_del)})
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        arcpy.env.workspace = prev_ws
+                    except Exception:
+                        pass
+
+                if step2_removed:
+                    arcpy.AddMessage("Temporary data removed in Step 2:")
+                    for r in step2_removed:
+                        arcpy.AddMessage(f"  - {r}")
+                if step2_failed_deletes:
+                    arcpy.AddWarning("Some temporary items from Step 2 could not be deleted:")
+                    for fi in step2_failed_deletes:
+                        arcpy.AddWarning(f"  - {fi.get('path')}: {fi.get('error')}")
+            except Exception as e:
+                arcpy.AddWarning(f"Cleanup during Step 2 encountered errors: {e}")
 
             # FUNKY final summary block for Step 2
             arcpy.AddMessage("\n" + ("✨" * 12))
@@ -1775,7 +2097,7 @@ class AddStandardProjectLayers(object):
         sr = query_result.get('spatialReference') or {"wkid": 4326}
         polygon = arcpy.AsShape({"rings": feat['geometry']['rings'], "spatialReference": sr}, True)
 
-        temp_fc = os.path.join("memory", f"study_area_{project_number}")
+        temp_fc = os.path.join("memory", f"study_area_{project_number}_{uuid.uuid4().hex[:6]}")
         arcpy.management.CopyFeatures(polygon, temp_fc)
 
         # Add basic attributes back (simplified)
