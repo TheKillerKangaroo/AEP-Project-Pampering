@@ -1,5 +1,25 @@
 # -*- coding: utf-8 -*-
 """
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                .......   ........                                                                  
+            .:---------------------:.                  .%%%%%%.    :%%%%%%%%%%%  #%%%%%%%#+         
+          .---------------------------:.               :%%%%%%:    :%%%%%%%%%%%  #%%%%%%%%%%:       
+         ------------------------=------.              *%%%%%%*    :%%%#         #%%%. .:%%%%.      
+       .-----------------------#@@=------:.           .%%%+%%%%.   :%%%#         #%%%.  .%%%%.      
+      .----------------------@@@%---------.           :%%%.#%%%:   :%%%#         #%%%.  .%%%%.      
+      .-------+@@@@*------=@@%=------------.          =%%%.:%%%=   :%%%#         #%%%.  .%%%%.      
+      :---------#@@@@*++@@#.---------------.         .%%%# .%%%%   :%%%%%%%%%:   #%%%-::+%%%%.      
+      :---------=#@@@@@@@..----------------.         .%%%-  #%%%:  :%%%%%%%%%:   #%%%%%%%%%%.       
+      .-----------.:+#@@@@@#=--------------.         -%%%   +%%%-  :%%%#         #%%%#**+=.         
+      .-----------------------------------.          *%%%****%%%*  :%%%#         #%%%.              
+       .-------------++------------------:.         .%%%%%%%%%%%%. :%%%#         #%%%.              
+         :-----------=------------------.           :%%%-....#%%%- :%%%#.......  #%%%.              
+          .---------------------------:             +%%%     -%%%+ :%%%%%%%%%%%  #%%%.              
+            ..:--------------------:.              .%%%%     .%%%% :%%%%%%%%%%%  #%%%.              
+                                                                                                                                                            
+                                                                                                    
 ArcGIS Pro Project Framework Toolbox
 For environmental assessment projects in New South Wales, Australia
 Requires ArcGIS Pro 3.6 or greater
@@ -16,6 +36,64 @@ import re
 
 # Global Path to Layer File (Standard Styling)
 LAYERFILE_PATH = r"G:\Shared drives\99.3 GIS Admin\Production\Layer Files\AEP - Study Area.lyrx"
+
+
+# Module-level helper: build a SQL WHERE clause that respects the target field type when possible.
+def build_project_defq(project_number, layer=None):
+    """
+    Build a WHERE clause for project_number + EndDate IS NULL that matches the
+    target field type when a layer object/path is available.
+
+    - If `layer` is provided, inspect the project_number field type via arcpy.ListFields(layer)
+      and emit a numeric comparison for numeric field types, otherwise a quoted string.
+    - If `layer` is not provided, fall back to value-based detection (digits -> numeric),
+      but callers should pass a layer when possible to avoid invalid SQL.
+    Returns full clause, e.g. "project_number = 6666 AND EndDate IS NULL" or
+    "project_number = 'ABC123' AND EndDate IS NULL".
+    """
+    if project_number is None:
+        return "EndDate IS NULL"
+
+    pn = str(project_number).strip()
+
+    def quoted(val):
+        return "'" + val.replace("'", "''") + "'"
+
+    # If layer provided, inspect fields on it to determine type
+    if layer is not None:
+        try:
+            for f in arcpy.ListFields(layer):
+                if f.name.lower() in ("project_number", "projectnumber", "project_num", "projectnum"):
+                    ftype = getattr(f, "type", "").lower()
+                    # numeric types used by arcpy: 'smallinteger', 'integer', 'single', 'double', 'oid', 'long'
+                    if ftype in ("smallinteger", "integer", "single", "double", "oid", "long"):
+                        try:
+                            if pn.isdigit():
+                                return f"project_number = {int(pn)} AND EndDate IS Null"
+                            fv = float(pn)
+                            if fv.is_integer():
+                                return f"project_number = {int(fv)} AND EndDate IS Null"
+                        except Exception:
+                            # If casting fails, fall back to quoted
+                            return f"project_number = {quoted(pn)} AND EndDate IS Null"
+                    else:
+                        # text-like field -> quote
+                        return f"project_number = {quoted(pn)} AND EndDate IS Null"
+        except Exception:
+            # if field inspection fails, fall back to value-based below
+            pass
+
+    # No layer or inspection failed -> fall back to value-based detection
+    if pn.isdigit():
+        return f"project_number = {int(pn)} AND EndDate IS Null"
+    try:
+        f = float(pn)
+        if f.is_integer():
+            return f"project_number = {int(f)} AND EndDate IS Null"
+    except Exception:
+        pass
+
+    return f"project_number = {quoted(pn)} AND EndDate IS Null"
 
 
 class Toolbox(object):
@@ -170,6 +248,202 @@ class CreateSubjectSite(object):
                 p_proj_name.setErrorMessage("Project Name too long (>150 chars).")
         return
 
+    # Helper to normalise addDataFromPath return and extract a usable layer object
+    def _normalize_added(self, added):
+        """
+        addDataFromPath may return a single Layer object, a GroupLayer, or a list.
+        Return a tuple (top_object, child_layer_or_none, parent_object_or_none)
+        - top_object: the object returned or first item when list
+        - child_layer_or_none: the actual sublayer if top_object is a group and has children; else same as top_object
+        - parent_object_or_none: the original top_object (useful to remove parent group after extracting child)
+        """
+        top = added
+        try:
+            # some runtimes return lists
+            if isinstance(added, (list, tuple)):
+                if len(added) > 0:
+                    top = added[0]
+                else:
+                    top = None
+        except Exception:
+            top = added
+
+        if top is None:
+            return (None, None, None)
+
+        parent = top
+        child = top
+        try:
+            if getattr(top, "isGroupLayer", False):
+                # prefer first child that supports a name/connectionProperties
+                try:
+                    children = top.listLayers()
+                    if children:
+                        # pick first child that looks like a layer
+                        for c in children:
+                            if getattr(c, "connectionProperties", None) is not None or getattr(c, "isGroupLayer", False) is False:
+                                child = c
+                                break
+                        # if none matched, just take first
+                        if child is None and len(children) > 0:
+                            child = children[0]
+                except Exception:
+                    child = None
+        except Exception:
+            pass
+
+        return (top, child or top, parent if parent is not child else None)
+
+    def _apply_style_swap(self, site_map, data_layer, style_path, display_name=None, set_defq=None):
+        """
+        Attempt Headmaster-style swap:
+        - import style (addDataFromPath)
+        - extract actual style sublayer
+        - updateConnectionProperties to point at data_layer connection
+        - if updateConnectionProperties fails, try ApplySymbologyFromLayer on the style layer
+        - set definition query on style layer if provided and supported
+        - remove original data_layer and any parent imported group
+        Returns final_layer (the styled layer) or None on complete failure.
+        """
+        final_layer = data_layer
+        try:
+            added = site_map.addDataFromPath(style_path)
+        except Exception as e:
+            arcpy.AddWarning(f"  - Could not import style '{style_path}': {e}")
+            return None
+
+        top, style_layer, parent = self._normalize_added(added)
+        if style_layer is None:
+            arcpy.AddWarning(f"  - Imported style produced no usable layer object: {style_path}")
+            try:
+                if top and top is not data_layer:
+                    site_map.removeLayer(top)
+            except Exception:
+                pass
+            return None
+
+        # capture connection and def query from data_layer
+        try:
+            conn_props = data_layer.connectionProperties
+        except Exception:
+            conn_props = None
+        try:
+            def_query = data_layer.definitionQuery if data_layer.supports("DEFINITIONQUERY") else None
+        except Exception:
+            def_query = None
+
+        update_ok = False
+        # try to update connection properties on style_layer
+        if conn_props:
+            try:
+                style_layer.updateConnectionProperties(style_layer.connectionProperties, conn_props)
+                update_ok = True
+            except Exception as e:
+                arcpy.AddWarning(f"  - updateConnectionProperties failed for '{style_path}': {e}")
+                # attempt ApplySymbologyFromLayer fallback on the imported style layer
+                try:
+                    arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
+                    update_ok = True
+                    arcpy.AddMessage(f"  • Applied symbology to imported style layer via ApplySymbologyFromLayer as workaround.")
+                except Exception as e2:
+                    arcpy.AddWarning(f"  - ApplySymbologyFromLayer on imported style also failed: {e2}")
+
+        # restore def query from data_layer (or provided)
+        try:
+            if set_defq and style_layer.supports("DEFINITIONQUERY"):
+                style_layer.definitionQuery = set_defq
+            elif def_query and style_layer.supports("DEFINITIONQUERY"):
+                style_layer.definitionQuery = def_query
+        except Exception:
+            pass
+
+        # rename style layer to display_name if provided
+        try:
+            if display_name:
+                style_layer.name = display_name
+        except Exception:
+            pass
+
+        # remove original data layer (only after we've attempted to apply symbology)
+        try:
+            site_map.removeLayer(data_layer)
+        except Exception:
+            # if removal fails, try hiding it
+            try:
+                data_layer.visible = False
+            except:
+                pass
+
+        # remove parent import wrapper if it's a group and different from style_layer
+        try:
+            if parent and parent is not style_layer:
+                try:
+                    site_map.removeLayer(parent)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        final_layer = style_layer
+        return final_layer
+
+    def _cleanup_duplicates(self, site_map, final_layer, display_name, preexisting_names=None):
+        """
+        Remove layers with the same display name that were present before this run.
+        - preexisting_names: optional set of layer names that existed before we added the new layer(s).
+          Only layers whose name is in preexisting_names will be removed. This avoids removing
+          layers that we added during this run.
+        - If preexisting_names is None, the function falls back to a conservative behaviour:
+          it will hide (not remove) any other layer with the same name.
+        """
+        try:
+            final_name = getattr(final_layer, "name", display_name)
+
+            for lyr in list(site_map.listLayers()):
+                try:
+                    # skip the final layer by name + longName check
+                    if getattr(lyr, "name", "") == final_name:
+                        try:
+                            if getattr(lyr, "longName", "") == getattr(final_layer, "longName", ""):
+                                continue
+                        except Exception:
+                            if lyr is final_layer:
+                                continue
+
+                    # Only consider layers that match the display_name
+                    if getattr(lyr, "name", "") != display_name:
+                        continue
+
+                    # If we have a list of preexisting names, only remove layers that were present before we ran.
+                    if preexisting_names is not None:
+                        if display_name not in preexisting_names:
+                            # Do not remove layers we did not previously have in the map
+                            continue
+                        # remove the layer that was preexisting (and matches the name)
+                        try:
+                            site_map.removeLayer(lyr)
+                            arcpy.AddMessage(f"  • Removed pre-existing duplicate layer '{display_name}'.")
+                        except Exception:
+                            try:
+                                lyr.visible = False
+                            except Exception:
+                                pass
+                    else:
+                        # Conservative fallback: don't delete — hide instead and log
+                        try:
+                            lyr.visible = False
+                            arcpy.AddMessage(f"  • Hid duplicate layer '{display_name}' (conservative fallback).")
+                        except Exception:
+                            try:
+                                site_map.removeLayer(lyr)
+                                arcpy.AddMessage(f"  • Removed duplicate layer '{display_name}' (fallback).")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def execute(self, parameters, messages):
         # We use param[1] (The Selected Address) for the actual processing
         site_address = parameters[1].valueAsText
@@ -237,12 +511,67 @@ class CreateSubjectSite(object):
             arcpy.management.MakeFeatureLayer(property_service_url, temp_property_layer)
 
             arcpy.AddMessage("Selecting property parcel...")
+            # first try strict CONTAINS
             arcpy.management.SelectLayerByLocation(temp_property_layer, "CONTAINS", temp_geocoded)
-
             property_count = int(arcpy.management.GetCount(temp_property_layer).getOutput(0))
+
             if property_count == 0:
-                arcpy.AddError("No property polygon found at this location (NSW Cadastre).")
-                return
+                arcpy.AddMessage("  - No parcel selected with CONTAINS; trying INTERSECT with a small buffer around the geocoded point as a fallback...")
+
+                try:
+                    # get spatial reference of the cadastre layer
+                    desc = arcpy.Describe(temp_property_layer)
+                    layer_sr = getattr(desc, "spatialReference", None)
+
+                    # create a copy of the geocoded point and project to the layer SR if needed
+                    pt_in = os.path.join("memory", "temp_geocode_copy")
+                    if arcpy.Exists(pt_in):
+                        try: arcpy.management.Delete(pt_in)
+                        except: pass
+                    arcpy.management.CopyFeatures(temp_geocoded, pt_in)
+
+                    proj_pt = pt_in
+                    if layer_sr and getattr(layer_sr, "factoryCode", None) and layer_sr.factoryCode != 4326:
+                        # project into cadastre SR in memory
+                        proj_pt = os.path.join("memory", "temp_geocode_proj")
+                        try:
+                            if arcpy.Exists(proj_pt):
+                                try: arcpy.management.Delete(proj_pt)
+                                except: pass
+                            arcpy.management.Project(pt_in, proj_pt, layer_sr)
+                        except Exception:
+                            # if project fails, continue with original pt_in
+                            proj_pt = pt_in
+
+                    # buffer the point a small distance (2 metres) using GEODESIC for safety
+                    buf_fc = os.path.join("memory", "temp_geocode_buf")
+                    if arcpy.Exists(buf_fc):
+                        try: arcpy.management.Delete(buf_fc)
+                        except: pass
+                    arcpy.analysis.Buffer(proj_pt, buf_fc, "2 Meters", method="GEODESIC")
+
+                    # try INTERSECT using the small buffer
+                    arcpy.management.SelectLayerByLocation(temp_property_layer, "INTERSECT", buf_fc)
+                    property_count = int(arcpy.management.GetCount(temp_property_layer).getOutput(0))
+
+                    # cleanup memory fcs (best-effort)
+                    try: arcpy.management.Delete(pt_in)
+                    except: pass
+                    try: arcpy.management.Delete(proj_pt)
+                    except: pass
+                    try: arcpy.management.Delete(buf_fc)
+                    except: pass
+
+                    if property_count == 0:
+                        arcpy.AddError("No property polygon found at this location (NSW Cadastre) after fallback attempt.")
+                        return
+                    else:
+                        arcpy.AddMessage(f"  ✓ Found {property_count} parcel(s) using buffer+INTERSECT fallback.")
+
+                except Exception as e:
+                    arcpy.AddWarning(f"  - Buffer/INTERSECT fallback failed: {e}")
+                    arcpy.AddError("No property polygon found at this location (NSW Cadastre).")
+                    return
 
             # Copy selection to local GDB
             temp_property = os.path.join(default_gdb, "temp_property")
@@ -257,11 +586,57 @@ class CreateSubjectSite(object):
 
             # Handle multi-polygon properties
             if property_count > 1:
-                dissolved = os.path.join(default_gdb, "temp_dissolved")
-                if arcpy.Exists(dissolved):
-                    arcpy.management.Delete(dissolved)
-                arcpy.management.Dissolve(temp_property, dissolved, multi_part="MULTI_PART")
-                working_fc = dissolved
+                # Try dissolving in memory first to avoid file GDB locks
+                dissolved_mem = os.path.join("in_memory", "temp_dissolved")
+                dissolved_gdb = os.path.join(default_gdb, "temp_dissolved")
+                try:
+                    # ensure no leftover in memory
+                    if arcpy.Exists(dissolved_mem):
+                        try:
+                            arcpy.management.Delete(dissolved_mem)
+                        except:
+                            pass
+
+                    arcpy.AddMessage("  • Performing Dissolve in memory to avoid gdb locks...")
+                    arcpy.management.Dissolve(temp_property, dissolved_mem, multi_part="MULTI_PART")
+
+                    # Copy result back to default gdb so it persists for downstream processing
+                    if arcpy.Exists(dissolved_gdb):
+                        try:
+                            arcpy.management.Delete(dissolved_gdb)
+                        except:
+                            pass
+                    arcpy.management.CopyFeatures(dissolved_mem, dissolved_gdb)
+
+                    # set working_fc to the persistent copy in the default gdb
+                    working_fc = dissolved_gdb
+
+                    # cleanup memory copy (best-effort)
+                    try:
+                        if arcpy.Exists(dissolved_mem):
+                            arcpy.management.Delete(dissolved_mem)
+                    except:
+                        pass
+
+                except arcpy.ExecuteError as ge:
+                    # memory dissolve failed (maybe memory limitations or other). Try clearing workspace cache and do a file-gdb dissolve with a unique name.
+                    arcpy.AddWarning(f"Memory Dissolve failed: {ge}\nAttempting alternative dissolve in default geodatabase.")
+                    try:
+                        arcpy.ClearWorkspaceCache_management()
+                    except:
+                        pass
+
+                    # attempt a dissolve into a timestamped gdb FC to reduce name collisions/locks
+                    alt_name = f"temp_dissolved_{int(time.time())}"
+                    alt_dissolved = os.path.join(default_gdb, alt_name)
+                    try:
+                        arcpy.management.Dissolve(temp_property, alt_dissolved, multi_part="MULTI_PART")
+                        working_fc = alt_dissolved
+                    except Exception as e2:
+                        # If this still fails, surface a clear error for debugging
+                        arcpy.AddError(f"Could not perform Dissolve (tried memory and file gdb): {e2}")
+                        raise
+
             else:
                 working_fc = temp_property
 
@@ -306,7 +681,8 @@ class CreateSubjectSite(object):
                 temp_target_layer = "temp_target_layer"
                 # Make a layer from the feature service (layer URL)
                 arcpy.management.MakeFeatureLayer(target_layer_url, temp_target_layer)
-                where_clause = f"project_number = '{project_number}' AND EndDate IS NULL"
+                # Build a WHERE clause that respects the layer field types
+                where_clause = build_project_defq(project_number, layer=temp_target_layer)
                 arcpy.management.SelectLayerByAttribute(temp_target_layer, "NEW_SELECTION", where_clause)
                 existing_count = int(arcpy.management.GetCount(temp_target_layer).getOutput(0))
                 if existing_count > 0:
@@ -345,21 +721,54 @@ class CreateSubjectSite(object):
             # 6. Add to Map (No Zoom)
             try:
                 map_obj = aprx.activeMap
-                if map_obj and os.path.exists(LAYERFILE_PATH):
-                    arcpy.AddMessage(f"Adding styled layer from: {LAYERFILE_PATH}")
-                    lyr_file = arcpy.mp.LayerFile(LAYERFILE_PATH)
-                    added_layers = map_obj.addLayer(lyr_file)
+                if map_obj:
+                    # We'll use a single-final-layer approach consistent with HeadmasterStyles:
+                    try:
+                        # Add the layer (PSA) to the map
+                        psa_layer = map_obj.addDataFromPath(working_fc)
+                        # Normalise returned object
+                        top, child, parent = self._normalize_added(psa_layer)
+                        psa_layer_obj = child or top
+                        try:
+                            psa_layer_obj.name = f"Project Study Area {project_number}"
+                        except:
+                            pass
 
-                    if added_layers:
-                        target_lyr = added_layers[0]
-                        target_lyr.name = f"Project Study Area {project_number}"
+                        # Attempt swap with LAYERFILE_PATH and ensure definition query is applied to the final layer
+                        final_psa = None
+                        if os.path.exists(LAYERFILE_PATH):
+                            applied = False
+                            # Try swap (pass layer-aware definition query built using psa_layer_obj)
+                            dq_for_psa = build_project_defq(project_number, layer=psa_layer_obj)
+                            final = self._apply_style_swap(map_obj, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=dq_for_psa)
+                            if final is not None:
+                                final_psa = final
+                                applied = True
+                                arcpy.AddMessage("  ✓ Applied standard Study Area symbology to PSA by swapping.")
+                            else:
+                                # fallback to ApplySymbologyFromLayer on the data layer
+                                try:
+                                    arcpy.management.ApplySymbologyFromLayer(psa_layer_obj, LAYERFILE_PATH)
+                                    final_psa = psa_layer_obj
+                                    applied = True
+                                    arcpy.AddMessage("  ✓ Applied standard Study Area symbology using ApplySymbologyFromLayer.")
+                                except Exception as e_sym:
+                                    arcpy.AddWarning(f"  - Could not apply standard symbology to Project Study Area: {e_sym}")
 
-                        if target_lyr.supports("DEFINITIONQUERY"):
-                            dq = f"project_number = '{project_number}' AND EndDate IS Null"
-                            target_lyr.definitionQuery = dq
-                            arcpy.AddMessage(f"✓ Layer renamed and filtered to project {project_number} AND EndDate IS Null")
+                            # ensure definition query is applied using layer-aware builder
+                            try:
+                                if final_psa and final_psa.supports("DEFINITIONQUERY"):
+                                    final_psa.definitionQuery = build_project_defq(project_number, layer=final_psa)
+                                    arcpy.AddMessage("  ✓ Applied definition query to Project Study Area layer.")
+                            except Exception:
+                                pass
+                        else:
+                            arcpy.AddWarning("  - PSA layerfile not found; PSA added without standard styling.")
+
+                    except Exception as e:
+                        arcpy.AddWarning(f"Map update for PSA failed: {e}")
                 else:
-                    arcpy.AddWarning("Map or Layer File not found. Layer not added to map.")
+                    arcpy.AddWarning("No active map to add PSA.")
             except Exception as e:
                 arcpy.AddWarning(f"Could not update map: {str(e)}")
 
@@ -488,7 +897,7 @@ class CreateSubjectSite(object):
             def _fetch_service_metadata(service_url, token=None):
                 """
                 Try a couple of sensible metadata endpoints for the given service URL and return a small dict
-                with a few useful keys (if available). This is optional and best-effort.
+                with a few useful fields (if available). This is optional and best-effort.
                 """
                 try_urls = []
                 base = service_url.rstrip('/')
@@ -525,6 +934,79 @@ class CreateSubjectSite(object):
             # Track whether we've created the Site Details Map in this run so we can add the study area first
             site_map_created_in_run = False
 
+            # Find or create the "Site Details Map" once, before processing records.
+            site_map = None
+            maps = [m for m in aprx.listMaps() if m.name == "Site Details Map"]
+            if maps:
+                site_map = maps[0]
+            else:
+                try:
+                    site_map = aprx.createMap("Site Details Map")
+                    site_map_created_in_run = True
+                    arcpy.AddMessage("  ✓ Created 'Site Details Map'.")
+                    # Attempt to apply Imagery Hybrid basemap if the API supports it
+                    try:
+                        site_map.addBasemap("Imagery Hybrid")
+                        arcpy.AddMessage("  ✓ Applied 'Imagery Hybrid' basemap to 'Site Details Map'.")
+                    except Exception:
+                        arcpy.AddWarning("  - Could not apply 'Imagery Hybrid' basemap programmatically; add it manually if required.")
+                    # Attempt to set the map spatial reference to GDA2020 / NSW Lambert (8058) if supported
+                    try:
+                        site_map.spatialReference = arcpy.SpatialReference(8058)
+                        arcpy.AddMessage("  ✓ Set 'Site Details Map' spatial reference to GDA2020 / NSW Lambert (8058).")
+                    except Exception:
+                        arcpy.AddWarning("  - Could not set spatial reference on 'Site Details Map' programmatically; layers will retain their own spatial references.")
+                except Exception as cm_err:
+                    arcpy.AddWarning(f"  - Could not create 'Site Details Map': {cm_err}")
+                    site_map = None
+
+            # Capture pre-existing layer names in the Site Details Map so we only remove pre-existing layers later
+            preexisting_layer_names = set()
+            try:
+                if site_map:
+                    preexisting_layer_names = {getattr(lyr, "name", "") for lyr in site_map.listLayers() if getattr(lyr, "name", "")}
+            except Exception:
+                preexisting_layer_names = set()
+
+            # If we created the map just now, add the PSA first and style it (so it sits at root).
+            if site_map_created_in_run and site_map:
+                try:
+                    psa_added = site_map.addDataFromPath(study_area_fc)
+                    top_p, child_p, parent_p = self._normalize_added(psa_added)
+                    psa_layer_obj = child_p or top_p
+                    try:
+                        psa_layer_obj.name = f"Project Study Area {project_number}"
+                    except:
+                        pass
+                    final_psa_layer = psa_layer_obj
+                    if os.path.exists(LAYERFILE_PATH):
+                        final = self._apply_style_swap(site_map, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=build_project_defq(project_number, layer=psa_layer_obj))
+                        if final:
+                            final_psa_layer = final
+                            arcpy.AddMessage("  ✓ Applied standard Study Area symbology to PSA by swapping.")
+                        else:
+                            try:
+                                arcpy.management.ApplySymbologyFromLayer(psa_layer_obj, LAYERFILE_PATH)
+                                final_psa_layer = psa_layer_obj
+                                arcpy.AddMessage("  ✓ Applied standard Study Area symbology using ApplySymbologyFromLayer.")
+                            except Exception as e_fall:
+                                arcpy.AddWarning(f"  - PSA ApplySymbologyFromLayer fallback failed: {e_fall}")
+                    try:
+                        dq = build_project_defq(project_number, layer=final_psa_layer)
+                        if final_psa_layer and final_psa_layer.supports("DEFINITIONQUERY"):
+                            final_psa_layer.definitionQuery = dq
+                            arcpy.AddMessage("  ✓ Applied definition query to Project Study Area layer.")
+                    except Exception:
+                        pass
+                except Exception as eaddpsa:
+                    arcpy.AddWarning(f"  - Could not add Project Study Area layer to 'Site Details Map': {eaddpsa}")
+                # After initial PSA add, update preexisting names (PSA is now present but it's considered "new")
+                try:
+                    preexisting_layer_names = {getattr(lyr, "name", "") for lyr in site_map.listLayers() if getattr(lyr, "name", "")}
+                except Exception:
+                    pass
+
+            # Process each reference record
             for idx, feat in enumerate(features, start=1):
                 attrs = feat.get("attributes", {})
                 service_url = _get_attr_ci(attrs, "URL") or _get_attr_ci(attrs, "Url") or _get_attr_ci(attrs, "url")
@@ -534,10 +1016,30 @@ class CreateSubjectSite(object):
                 short_name = _get_attr_ci(attrs, "ShortName") or _get_attr_ci(attrs, "Shortname") or f"Layer_{idx}"
                 style_file = _get_attr_ci(attrs, "Style") or _get_attr_ci(attrs, "LayerFile") or _get_attr_ci(attrs, "lyrx")
 
+                # Normalize style_file: strip whitespace and surrounding quotes (some entries include them)
+                raw_style_file = style_file
+                if style_file:
+                    try:
+                        style_file = str(style_file).strip()
+                        # strip surrounding single/double quotes if present
+                        style_file = style_file.strip('\'"')
+                        # normalize path separators
+                        try:
+                            style_file = os.path.normpath(style_file)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                if raw_style_file != style_file:
+                    arcpy.AddMessage(f"  • Normalized style field: '{raw_style_file}' -> '{style_file or ''}'")
+
                 # create a sanitized feature class name for use inside the geodatabase
                 safe_short = _sanitize_fc_name(short_name)
 
-                arcpy.AddMessage(f"Processing reference record {idx}: ShortName='{short_name}' (safe: '{safe_short}') URL='{service_url}' Buffer={site_buffer} Action={buffer_action} Style='{style_file or ''}'")
+                # Safe messaging: ensure None -> ''
+                service_url_msg = service_url or ""
+                style_file_msg = style_file or ""
+                arcpy.AddMessage(f"Processing reference record {idx}: ShortName='{short_name}' (safe: '{safe_short}') URL='{service_url_msg}' Buffer={site_buffer} Action={buffer_action} Style='{style_file_msg}'")
 
                 # Validate service URL
                 if not service_url:
@@ -882,147 +1384,74 @@ class CreateSubjectSite(object):
                     arcpy.AddMessage(f"  ✓ Extracted '{short_name}' to {out_fc}")
                     processed_outputs.append({"shortname": short_name, "path": out_fc, "style": style_file, "fd": feature_dataset_name, "safe_short": safe_short})
 
-                    # --- NEW: Add the output layer to "Site Details Map" and place it in a group named after the feature dataset ---
+                    # Add the output layer to "Site Details Map" (root) and apply the style
                     try:
-                        # Find or create the "Site Details Map" in the current project
-                        site_map = None
-                        maps = [m for m in aprx.listMaps() if m.name == "Site Details Map"]
-                        if maps:
-                            site_map = maps[0]
-                        else:
-                            try:
-                                # create the map with default type (MAP). Do not pass basemap name as map_type.
-                                site_map = aprx.createMap("Site Details Map")
-                                site_map_created_in_run = True
-                                arcpy.AddMessage("  ✓ Created 'Site Details Map'.")
-                                # Attempt to apply Imagery Hybrid basemap if the API supports it
-                                try:
-                                    site_map.addBasemap("Imagery Hybrid")
-                                    arcpy.AddMessage("  ✓ Applied 'Imagery Hybrid' basemap to 'Site Details Map'.")
-                                except Exception:
-                                    # Not fatal — older runtimes may not support addBasemap or the string name
-                                    arcpy.AddWarning("  - Could not apply 'Imagery Hybrid' basemap programmatically; add it manually if required.")
-                                # Attempt to set the map spatial reference to GDA2020 / NSW Lambert (8058) if supported
-                                try:
-                                    site_map.spatialReference = arcpy.SpatialReference(8058)
-                                    arcpy.AddMessage("  ✓ Set 'Site Details Map' spatial reference to GDA2020 / NSW Lambert (8058).")
-                                except Exception:
-                                    arcpy.AddWarning("  - Could not set spatial reference on 'Site Details Map' programmatically; layers will retain their own spatial references.")
-                            except Exception as cm_err:
-                                arcpy.AddWarning(f"  - Could not create 'Site Details Map': {cm_err}")
-                                site_map = None
-
                         if site_map:
-                            # If we just created the map in this run, add the Project Study Area layer first (once)
+                            # Add data
+                            data_added = site_map.addDataFromPath(out_fc)
+                            top_added, added_child, parent_added = self._normalize_added(data_added)
+                            data_layer = added_child or top_added
+                            final_layer = data_layer
                             try:
-                                if site_map_created_in_run:
-                                    try:
-                                        # Add PSA using its path (study_area_fc is a memory FC path)
-                                        psa_layer = site_map.addDataFromPath(study_area_fc)
-                                        # set its name and attempt to style using global LAYERFILE_PATH
-                                        try:
-                                            psa_layer.name = f"Project Study Area {project_number}"
-                                        except:
-                                            pass
-                                        # apply standard styling if available
-                                        try:
-                                            if os.path.exists(LAYERFILE_PATH):
-                                                arcpy.management.ApplySymbologyFromLayer(psa_layer, LAYERFILE_PATH)
-                                                arcpy.AddMessage("  ✓ Applied standard Study Area symbology to Project Study Area layer.")
-                                            else:
-                                                arcpy.AddWarning("  - Standard Study Area layer file not found to apply styling.")
-                                        except Exception as e_sym:
-                                            arcpy.AddWarning(f"  - Could not apply standard symbology to Project Study Area: {e_sym}")
-
-                                        # try to set a definition query on the PSA layer if supported
-                                        try:
-                                            if psa_layer.supports("DEFINITIONQUERY"):
-                                                dq = f"project_number = '{project_number}' AND EndDate IS Null"
-                                                psa_layer.definitionQuery = dq
-                                                arcpy.AddMessage("  ✓ Applied definition query to Project Study Area layer.")
-                                        except Exception:
-                                            pass
-                                    except Exception as eaddpsa:
-                                        arcpy.AddWarning(f"  - Could not add Project Study Area layer to 'Site Details Map': {eaddpsa}")
-                                    # Ensure we don't add it again during this run
-                                    site_map_created_in_run = False
-
+                                data_layer.name = short_name
                             except Exception:
                                 pass
 
-                            # Add the feature class to the map (this will place it after existing layers unless we inserted)
-                            try:
-                                new_layer = site_map.addDataFromPath(out_fc)
-                                # Try to name the layer sensibly (display name)
-                                try:
-                                    new_layer.name = short_name
-                                except:
-                                    pass
+                            # Attempt to apply style if provided
+                            if style_file:
+                                style_path = os.path.expanduser(style_file)
+                                if not os.path.isabs(style_path):
+                                    try_paths = [
+                                        style_path,
+                                        os.path.join(os.path.dirname(arcpy.mp.ArcGISProject("CURRENT").filePath or ""), style_path),
+                                        os.path.join(default_gdb, style_path)
+                                    ]
+                                else:
+                                    try_paths = [style_path]
 
-                                # If the reference record provides a style layer file and it exists, apply it
-                                if style_file:
-                                    # style_file could be a path; try to expand user vars and check
-                                    style_path = os.path.expanduser(style_file)
-                                    if not os.path.isabs(style_path):
-                                        # try relative to project home or default GDB folder, try a couple of sensible locations
-                                        try_paths = [
-                                            style_path,
-                                            os.path.join(os.path.dirname(arcpy.mp.ArcGISProject("CURRENT").filePath or ""), style_path),
-                                            os.path.join(default_gdb, style_path)
-                                        ]
-                                    else:
-                                        try_paths = [style_path]
-
-                                    applied = False
-                                    for sp in try_paths:
-                                        try:
-                                            if os.path.exists(sp):
-                                                try:
-                                                    arcpy.management.ApplySymbologyFromLayer(new_layer, sp)
-                                                    arcpy.AddMessage(f"  ✓ Applied style from '{sp}' to layer '{short_name}'.")
-                                                    applied = True
-                                                    break
-                                                except Exception as ase:
-                                                    arcpy.AddWarning(f"  - Could not apply symbology from '{sp}' to '{short_name}': {ase}")
-                                        except Exception:
+                                applied = False
+                                for sp in try_paths:
+                                    try:
+                                        arcpy.AddMessage(f"  - Checking style candidate: {sp} (exists: {os.path.exists(sp)})")
+                                        if not os.path.exists(sp):
                                             continue
-                                    if not applied:
-                                        arcpy.AddMessage(f"  - No valid style file found or applied for '{short_name}' (checked {len(try_paths)} locations).")
 
-                                # Find or create a group layer with the feature dataset name
-                                group_layer = None
-                                try:
-                                    for lyr in site_map.listLayers():
-                                        # some Layer objects may not have isGroupLayer attribute in older runtimes; guard with getattr
-                                        if getattr(lyr, "isGroupLayer", False) and lyr.name == feature_dataset_name:
-                                            group_layer = lyr
+                                        # Try swap
+                                        final = self._apply_style_swap(site_map, data_layer, sp, display_name=short_name)
+                                        if final:
+                                            final_layer = final
+                                            applied = True
+                                            arcpy.AddMessage(f"  ✓ Applied style from '{sp}' by swapping for '{short_name}'.")
                                             break
-                                except Exception:
-                                    # listLayers may fail in some environments; ignore and proceed
-                                    pass
+                                        else:
+                                            # fallback to ApplySymbologyFromLayer
+                                            try:
+                                                arcpy.management.ApplySymbologyFromLayer(data_layer, sp)
+                                                final_layer = data_layer
+                                                applied = True
+                                                arcpy.AddMessage(f"  ✓ Applied style from '{sp}' using ApplySymbologyFromLayer for '{short_name}'.")
+                                                break
+                                            except Exception as e_f:
+                                                arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback also failed for '{sp}': {e_f}")
+                                                try:
+                                                    if parent_added:
+                                                        site_map.removeLayer(parent_added)
+                                                except:
+                                                    pass
+                                                continue
+                                    except Exception:
+                                        continue
+                                if not applied:
+                                    arcpy.AddMessage(f"  - No valid style file found or applied for '{short_name}' (checked {len(try_paths)} locations).")
 
-                                if not group_layer:
-                                    # Attempt to create a group layer; APIs vary across Pro versions so guard with try/except
-                                    try:
-                                        group_layer = site_map.createGroupLayer(feature_dataset_name)
-                                        arcpy.AddMessage(f"  ✓ Created group layer '{feature_dataset_name}' in 'Site Details Map'.")
-                                    except Exception as cg_err:
-                                        arcpy.AddWarning(f"  - Could not create group layer '{feature_dataset_name}' programmatically: {cg_err}. Layer will remain at root of map.")
-                                        group_layer = None
+                            # remove any duplicates that were pre-existing only
+                            try:
+                                self._cleanup_duplicates(site_map, final_layer, short_name, preexisting_names=preexisting_layer_names)
+                            except Exception:
+                                pass
 
-                                # If a group layer exists, try to move the newly added layer into it
-                                if group_layer:
-                                    try:
-                                        site_map.addLayerToGroup(group_layer, new_layer)
-                                    except Exception as mg_err:
-                                        arcpy.AddWarning(f"  - Could not move layer '{short_name}' into group '{feature_dataset_name}': {mg_err}")
-                                # else leave at root
-                            except Exception as add_err:
-                                arcpy.AddWarning(f"  - Could not add '{out_fc}' to 'Site Details Map': {add_err}")
-                    except Exception as map_err:
-                        arcpy.AddWarning(f"  - Error while attempting to add layer to 'Site Details Map': {map_err}")
-                    # --- END NEW SECTION ---
-
+                    except Exception as add_err:
+                        arcpy.AddWarning(f"  - Could not add '{out_fc}' to 'Site Details Map': {add_err}")
                 except Exception as e:
                     arcpy.AddWarning(f"  - Could not move temporary extract to final location for '{short_name}': {e}")
                     failed.append(short_name)
@@ -1309,22 +1738,41 @@ class AddStandardProjectLayers(object):
     def _get_study_area_by_project_number(self, target_layer_url, token, project_number):
         # Safely escape single quotes inside the project_number value only
         safe_project_number = project_number.replace("'", "''") if project_number else project_number
-        # Ensure we select only the active record(s) (EndDate IS NULL) for the project number
-        where = f"project_number='{safe_project_number}' AND EndDate IS NULL"
 
-        params = {"where": where, "outFields": "*", "returnGeometry": "true", "outSR": "4326", "f": "json"}
-        if token:
-            params["token"] = token
-        query_url = f"{target_layer_url}/query?{urllib.parse.urlencode(params)}"
+        # Because we don't have a layer to inspect here (REST query), try numeric-unquoted first
+        attempts = []
+        if safe_project_number and safe_project_number.isdigit():
+            attempts.append(f"project_number = {int(safe_project_number)} AND EndDate IS NULL")
+        try:
+            f = float(safe_project_number)
+            if f.is_integer():
+                attempts.append(f"project_number = {int(f)} AND EndDate IS NULL")
+        except Exception:
+            pass
+        # always try quoted as final fallback
+        attempts.append(f"project_number = '{safe_project_number}' AND EndDate IS NULL")
 
-        with urllib.request.urlopen(query_url, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
+        query_result = None
+        for where in attempts:
+            params = {"where": where, "outFields": "*", "returnGeometry": "true", "outSR": "4326", "f": "json"}
+            if token:
+                params["token"] = token
+            query_url = f"{target_layer_url}/query?{urllib.parse.urlencode(params)}"
+            try:
+                with urllib.request.urlopen(query_url, timeout=30) as resp:
+                    data = json.loads(resp.read().decode())
+                if data.get("features"):
+                    query_result = data
+                    break
+            except Exception:
+                # try next form
+                continue
 
-        if not data.get('features'):
+        if not query_result:
             return None
 
-        feat = data['features'][0]
-        sr = data.get('spatialReference') or {"wkid": 4326}
+        feat = query_result['features'][0]
+        sr = query_result.get('spatialReference') or {"wkid": 4326}
         polygon = arcpy.AsShape({"rings": feat['geometry']['rings'], "spatialReference": sr}, True)
 
         temp_fc = os.path.join("memory", f"study_area_{project_number}")
