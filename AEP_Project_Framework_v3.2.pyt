@@ -51,6 +51,13 @@ import re
 import uuid
 import traceback
 
+# Import external PCT report helper (optional)
+try:
+    from pct_report import create_pct_report
+except Exception:
+    # If the helper isn't present, we'll continue but skip external PCT report functionality.
+    create_pct_report = None
+
 # Global Path to Layer File (Standard Styling)
 LAYERFILE_PATH = r"G:\Shared drives\99.3 GIS Admin\Production\Layer Files\AEP - Study Area.lyrx"
 
@@ -1891,8 +1898,8 @@ class CreateSubjectSite(object):
                     except:
                         pass
 
-            # 5. Create the PCT_Report table
-            arcpy.AddMessage("Creating PCT_REPORT table...")
+            # 5. Create the PCT_REPORT table (moved to external helper)
+            arcpy.AddMessage("Creating PCT_REPORT (external helper) ...")
             pct_fc = None
             for po in processed_outputs:
                 if "pct" in po["shortname"].lower() or "svtm_pct" in po["shortname"].lower():
@@ -1902,59 +1909,17 @@ class CreateSubjectSite(object):
             if not pct_fc:
                 arcpy.AddWarning("Could not find an SVTM_PCT layer among processed outputs. Skipping PCT_REPORT.")
             else:
-                arcpy.AddMessage(f"  - Using PCT layer at {pct_fc}")
-
-                if not arcpy.ListFields(pct_fc, "area_m"):
-                    arcpy.management.AddField(pct_fc, "area_m", "DOUBLE")
-                if not arcpy.ListFields(pct_fc, "SiteCoveragePct"):
-                    arcpy.management.AddField(pct_fc, "SiteCoveragePct", "DOUBLE")
-
-                with arcpy.da.UpdateCursor(pct_fc, ["SHAPE@", "area_m", "SiteCoveragePct"]) as uc:
-                    for row in uc:
-                        geom = row[0]
-                        a_m = geom.getArea("GEODESIC", "SQUAREMETERS")
-                        row[1] = a_m
-                        pct = (100.0 * a_m / site_area_m2) if site_area_m2 > 0 else 0.0
-                        row[2] = round(pct, 1)
-                        uc.updateRow(row)
-
-                pct_fields = [f.name for f in arcpy.ListFields(pct_fc)]
-                def get_field_by_candidates(cands):
-                    for c in cands:
-                        for f in pct_fields:
-                            if f.lower() == c.lower():
-                                return f
-                    return None
-
-                pctid_field = get_field_by_candidates(["PCTID", "pctid", "PCT_ID"])
-                pctname_field = get_field_by_candidates(["PCTName", "pctname", "PCT_Name", "PCTNAME"])
-
-                if not pctid_field or not pctname_field:
-                    arcpy.AddWarning("Could not find PCTID and PCTName fields in PCT layer; cannot create PCT_Report.")
+                if create_pct_report is not None:
+                    try:
+                        pct_table = create_pct_report(pct_fc, default_gdb, site_area_m2)
+                        if pct_table:
+                            arcpy.AddMessage(f"  ✓ PCT_Report created at {pct_table}")
+                        else:
+                            arcpy.AddWarning("  - PCT_Report helper ran but did not create a table.")
+                    except Exception as e:
+                        arcpy.AddWarning(f"  - Could not create PCT_Report via helper: {e}\n{traceback.format_exc()}")
                 else:
-                    summary = {}
-                    with arcpy.da.SearchCursor(pct_fc, [pctid_field, pctname_field, "area_m", "SiteCoveragePct"]) as sc:
-                        for r in sc:
-                            key = (r[0], r[1])
-                            if key not in summary:
-                                summary[key] = {"area_m": 0.0, "sitecov": 0.0}
-                            summary[key]["area_m"] += (r[2] or 0.0)
-                            summary[key]["sitecov"] += (r[3] or 0.0)
-
-                    pct_table = os.path.join(default_gdb, "PCT_Report")
-                    if arcpy.Exists(pct_table):
-                        arcpy.management.Delete(pct_table)
-                    arcpy.management.CreateTable(default_gdb, "PCT_Report")
-                    arcpy.management.AddField(pct_table, "PCTID", "TEXT", field_length=50)
-                    arcpy.management.AddField(pct_table, "PCTName", "TEXT", field_length=255)
-                    arcpy.management.AddField(pct_table, "Sum_area_m", "DOUBLE")
-                    arcpy.management.AddField(pct_table, "Sum_SiteCoveragePct", "DOUBLE")
-
-                    with arcpy.da.InsertCursor(pct_table, ["PCTID", "PCTName", "Sum_area_m", "Sum_SiteCoveragePct"]) as ins:
-                        for (pid, pname), vals in summary.items():
-                            ins.insertRow([str(pid), str(pname), vals["area_m"], round(vals["sitecov"], 1)])
-
-                    arcpy.AddMessage(f"  ✓ PCT_Report created: {pct_table}")
+                    arcpy.AddWarning("  - External pct_report helper not available; skipping PCT_Report creation.")
 
             # Final summary of processing for QA (existing summary retained)
             arcpy.AddMessage("\nExtraction summary:")
