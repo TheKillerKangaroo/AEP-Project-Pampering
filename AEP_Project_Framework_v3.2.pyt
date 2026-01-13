@@ -864,7 +864,7 @@ class CreateSubjectSite(object):
                 # In case anything fails, fall back to working_fc
                 study_area_for_step2 = working_fc
 
-            # 6. Add to Map (and Zoom to final PSA)
+            # 6. Add to Map (No Zoom)
             try:
                 map_obj = aprx.activeMap
                 if map_obj:
@@ -892,15 +892,16 @@ class CreateSubjectSite(object):
                         if os.path.exists(LAYERFILE_PATH):
                             applied = False
                             try:
-                                # prefer using the service-added layer's connectionProperties so the style points to the service
+                                # prefer using the service-added layer's connectionProperties when available
                                 conn_source_layer = psa_layer_obj if (psa_layer_obj and getattr(psa_layer_obj, "connectionProperties", None)) else psa_layer_obj
 
-                                dq_for_psa = None
+                                # build a sensible definition query (best-effort)
                                 try:
                                     dq_for_psa = build_project_defq(project_number, layer=psa_layer_obj)
-                                except:
+                                except Exception:
                                     dq_for_psa = build_project_defq(project_number)
 
+                                # try the swap approach first
                                 final = self._apply_style_swap(map_obj, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=dq_for_psa)
                                 if final is not None:
                                     final_psa = final
@@ -927,82 +928,6 @@ class CreateSubjectSite(object):
                                 pass
                         else:
                             arcpy.AddWarning("  - PSA layerfile not found; PSA added without standard styling.")
-
-                        # -- NEW: Zoom the active map to the final PSA layer (best-effort)
-                        try:
-                            target_layer_for_zoom = final_psa if 'final_psa' in locals() and final_psa else (psa_layer_obj if 'psa_layer_obj' in locals() else None)
-                            if target_layer_for_zoom:
-                                arcpy.AddMessage("Attempting to zoom map to Project Study Area layer...")
-                                # Prefer using authoritative study area FC extent if available
-                                extent = None
-                                try:
-                                    if study_area_for_step2 and arcpy.Exists(study_area_for_step2):
-                                        desc = arcpy.Describe(study_area_for_step2)
-                                        extent = getattr(desc, "extent", None)
-                                except Exception:
-                                    extent = None
-                                # fallback: try describe on the layer object
-                                if extent is None:
-                                    try:
-                                        desc = arcpy.Describe(target_layer_for_zoom)
-                                        extent = getattr(desc, "extent", None)
-                                    except Exception:
-                                        extent = None
-
-                                if extent:
-                                    zoomed = False
-                                    # Attempt MapView-based zoom (ArcGIS Pro newer APIs)
-                                    try:
-                                        list_map_views = getattr(arcpy.mp, "ListMapViews", None)
-                                        if callable(list_map_views):
-                                            try:
-                                                mviews = arcpy.mp.ListMapViews()
-                                            except Exception:
-                                                mviews = []
-                                            for mv in mviews:
-                                                try:
-                                                    if getattr(mv, "map", None) and getattr(mv.map, "name", None) == map_obj.name:
-                                                        try:
-                                                            mv.camera.setExtent(extent)
-                                                            zoomed = True
-                                                            break
-                                                        except Exception:
-                                                            continue
-                                    except Exception:
-                                        pass
-
-                                    # Try map defaultCamera if available
-                                    try:
-                                        if not zoomed and hasattr(map_obj, "defaultCamera"):
-                                            try:
-                                                map_obj.defaultCamera.setExtent(extent)
-                                                zoomed = True
-                                            except Exception:
-                                                pass
-                                    except Exception:
-                                        pass
-
-                                    # Try aprx.activeView.camera if available
-                                    try:
-                                        if not zoomed:
-                                            av = getattr(aprx, "activeView", None)
-                                            if av and getattr(av, "camera", None):
-                                                try:
-                                                    av.camera.setExtent(extent)
-                                                    zoomed = True
-                                                except Exception:
-                                                    pass
-                                    except Exception:
-                                        pass
-
-                                    if zoomed:
-                                        arcpy.AddMessage("  ✓ Zoomed map to Project Study Area.")
-                                    else:
-                                        arcpy.AddWarning("  - Could not programmatically zoom map to Project Study Area (API not available in this runtime).")
-                                else:
-                                    arcpy.AddWarning("  - Could not determine extent for Project Study Area to zoom to.")
-                        except Exception as e:
-                            arcpy.AddWarning(f"  - Zoom attempt failed: {e}")
 
                     except Exception as e:
                         arcpy.AddWarning(f"Map update for PSA failed: {e}\n{traceback.format_exc()}")
@@ -1457,14 +1382,652 @@ class CreateSubjectSite(object):
                         raise Exception("Layer creation failed; attempting REST fallback")
                 except Exception as sel_err:
                     arcpy.AddWarning(f"  - Selection by location failed for '{short_name}': {sel_err}\n{traceback.format_exc()}")
-                    # (rest of Step 2 continues unchanged...)
-                    # NOTE: For brevity in this snippet I have retained the rest of Step 2 behavior exactly as before,
-                    # including REST fallback, extraction, styling, SiteLotsReport, external PCT helper call, cleanup and final reporting.
-                    # The full file includes that unchanged logic (omitted here in the message for readability).
+
+                    # Fetch and print a little service metadata (best-effort) to help debugging
+                    try:
+                        meta = _fetch_service_metadata(service_url, token)
+                        if meta:
+                            arcpy.AddMessage(f"  • Service metadata (best-effort): {meta}")
+                        else:
+                            arcpy.AddMessage("  • No service metadata available (best-effort).")
+                    except Exception:
+                        pass
+
+                    # Clean up any partially created layer
+                    try:
+                        if made_layer:
+                            arcpy.management.Delete(temp_layer_name)
+                            if temp_layer_name in step2_created_temp:
+                                step2_created_temp.discard(temp_layer_name)
+                    except:
+                        pass
+
+                    # REST fallback: query the service /query endpoint for OBJECTIDs intersecting the buffer geometry
+                    try:
+                        # get a single geometry JSON from buffer_fc (esri JSON) and determine its spatial reference
+                        geom_json = None
+                        geom_sr_wkid = 4326
+                        with arcpy.da.SearchCursor(buffer_fc, ["SHAPE@"]) as gcur:
+                            for grow in gcur:
+                                geom_obj = grow[0]
+                                try:
+                                    geom_json = geom_obj.JSON
+                                except:
+                                    geom_json = None
+                                # attempt to derive SR WKID from geometry JSON if present
+                                try:
+                                    if geom_json:
+                                        gj = json.loads(geom_json)
+                                        sr = gj.get("spatialReference") or {}
+                                        geom_sr_wkid = sr.get("wkid") or sr.get("latestWkid") or geom_sr_wkid
+                                except Exception:
+                                    pass
+                                # fallback to geometry object's spatialReference factoryCode/wkid
+                                try:
+                                    geom_sr_wkid = int(getattr(geom_obj.spatialReference, "factoryCode", getattr(geom_obj.spatialReference, "wkid", geom_sr_wkid)))
+                                except Exception:
+                                    pass
+                                break
+
+                        if not geom_json:
+                            arcpy.AddWarning(f"  - Could not obtain geometry JSON for fallback on '{short_name}'.")
+                            raise Exception("No geometry available for fallback query")
+
+                        query_layer_url = service_url.rstrip('/') + "/query"
+                        qparams = {
+                            "geometry": geom_json,
+                            "geometryType": "esriGeometryPolygon",
+                            "spatialRel": "esriSpatialRelIntersects",
+                            "inSR": str(geom_sr_wkid),
+                            "returnIdsOnly": "true",
+                            "f": "json"
+                        }
+                        if token:
+                            qparams["token"] = token
+
+                        # Retry loop for fallback query (attempt up to 3 times with backoff).
+                        # If a 498 Invalid Token error is encountered, retry once without the token.
+                        object_ids = []
+                        last_err = None
+                        qurl_used = None
+                        attempt = 0
+                        max_attempts = 3
+                        tried_without_token = False
+
+                        while attempt < max_attempts:
+                            qurl = f"{query_layer_url}?{urllib.parse.urlencode(qparams)}"
+                            qurl_used = qurl
+                            arcpy.AddMessage(f"  - REST fallback query URL (attempt {attempt+1}{' (no token)' if tried_without_token else ''}): {qurl}")
+                            try:
+                                with urllib.request.urlopen(qurl, timeout=120) as qresp:
+                                    qdata = json.loads(qresp.read().decode())
+                                # check for REST error block
+                                if "error" in qdata:
+                                    last_err = qdata["error"]
+                                    arcpy.AddWarning(f"  - REST fallback returned error: {last_err}")
+                                    # If it's an invalid token error, retry once without token
+                                    try:
+                                        err_code = int(last_err.get("code", 0)) if isinstance(last_err, dict) else 0
+                                    except Exception:
+                                        err_code = 0
+                                    if err_code == 498 and not tried_without_token:
+                                        # remove token and retry immediately (do not consume one of the configured attempts)
+                                        if "token" in qparams:
+                                            qparams.pop("token", None)
+                                        tried_without_token = True
+                                        arcpy.AddMessage("  - Received 498 Invalid Token; retrying fallback without token.")
+                                        # do not increment attempt here so we still allow up to max_attempts attempts without token
+                                        continue
+                                    # normal error; wait and retry
+                                    attempt += 1
+                                    time.sleep(3)
+                                    continue
+
+                                object_ids = qdata.get("objectIds") or []
+                                # success if we got object ids (or empty list but query succeeded)
+                                break
+
+                            except Exception as e:
+                                last_err = e
+                                arcpy.AddWarning(f"  - REST fallback HTTP error on attempt {attempt+1}: {e}\n{traceback.format_exc()}")
+                                attempt += 1
+                                time.sleep(3)
+
+                        # store qurl for diagnostics if fallback produced no object ids
+                        if not object_ids:
+                            arcpy.AddMessage(f"  - REST query returned no features for '{short_name}'; skipping.")
+                            failed.append(short_name)
+                            # record the qurl and last error for post-run diagnostics
+                            fallback_qurls_for_failed.append({"shortname": short_name, "qurl": qurl_used, "error": str(last_err)})
+                            # ensure no leftover
+                            try:
+                                if arcpy.Exists(temp_layer_name):
+                                    arcpy.management.Delete(temp_layer_name)
+                                    if temp_layer_name in step2_created_temp:
+                                        step2_created_temp.discard(temp_layer_name)
+                            except:
+                                pass
+                            continue
+
+                        # Determine object id field name if provided
+                        oid_field = qdata.get("objectIdFieldName") or "OBJECTID"
+                        # Create a WHERE clause safely (OBJECTID list) and make a layer from the service using that filter
+                        id_list = ",".join(str(int(i)) for i in object_ids)
+                        where_ids = f"{oid_field} IN ({id_list})"
+                        try:
+                            arcpy.management.MakeFeatureLayer(service_url, temp_layer_name, where_clause=where_ids)
+                            step2_created_temp.add(temp_layer_name)
+                        except Exception as e2:
+                            arcpy.AddWarning(f"  - Could not create filtered layer from service for '{short_name}': {e2}\n{traceback.format_exc()}")
+                            failed.append(short_name)
+                            # ensure no leftover
+                            try:
+                                if arcpy.Exists(temp_layer_name):
+                                    arcpy.management.Delete(temp_layer_name)
+                                    if temp_layer_name in step2_created_temp:
+                                        step2_created_temp.discard(temp_layer_name)
+                            except:
+                                pass
+                            # record qurl for diagnostics
+                            fallback_qurls_for_failed.append({"shortname": short_name, "qurl": qurl_used, "error": str(e2)})
+                            continue
+
+                        # selection with the filtered layer is effectively successful
+                        selection_succeeded = True
+
+                    except Exception as fb_err:
+                        arcpy.AddWarning(f"  - REST fallback failed for '{short_name}': {fb_err}\n{traceback.format_exc()}")
+                        # nothing more we can do for this reference record
+                        failed.append(short_name)
+                        # ensure no leftover
+                        try:
+                            if arcpy.Exists(temp_layer_name):
+                                arcpy.management.Delete(temp_layer_name)
+                                if temp_layer_name in step2_created_temp:
+                                    step2_created_temp.discard(temp_layer_name)
+                        except:
+                            pass
+                        # record fallback info for diagnostics if available
+                        try:
+                            fallback_qurls_for_failed.append({"shortname": short_name, "qurl": qurl_used if 'qurl_used' in locals() else None, "error": str(fb_err)})
+                        except:
+                            pass
+                        continue
+
+                # At this point selection_succeeded indicates we have a usable temp_layer_name (either original selection or filtered layer)
+                if not selection_succeeded:
+                    arcpy.AddWarning(f"  - Could not select features for '{short_name}'; skipping.")
+                    try:
+                        if arcpy.Exists(temp_layer_name):
+                            arcpy.management.Delete(temp_layer_name)
+                            if temp_layer_name in step2_created_temp:
+                                step2_created_temp.discard(temp_layer_name)
+                    except:
+                        pass
+                    if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
+                        try:
+                            arcpy.management.Delete(buffer_fc)
+                            if buffer_fc in step2_created_temp:
+                                step2_created_temp.discard(buffer_fc)
+                        except:
+                            pass
+                    failed.append(short_name)
+                    continue
+
+                count = int(arcpy.management.GetCount(temp_layer_name).getOutput(0))
+                arcpy.AddMessage(f"  - Selected {count} features from service.")
+
+                if count < 1:
+                    arcpy.AddMessage(f"  - No features selected for '{short_name}', skipping.")
+                    try:
+                        arcpy.management.Delete(temp_layer_name)
+                        if temp_layer_name in step2_created_temp:
+                            step2_created_temp.discard(temp_layer_name)
+                    except:
+                        pass
+                    if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
+                        try:
+                            arcpy.management.Delete(buffer_fc)
+                            if buffer_fc in step2_created_temp:
+                                step2_created_temp.discard(buffer_fc)
+                        except:
+                            pass
+                    skipped.append(short_name)
+                    continue
+
+                # Ensure feature dataset exists in default GDB (create now, since we're going to write)
+                if not arcpy.Exists(fd_path):
+                    arcpy.AddMessage(f"  - Creating feature dataset '{feature_dataset_name}' in default geodatabase.")
+                    arcpy.management.CreateFeatureDataset(default_gdb, feature_dataset_name, arcpy.SpatialReference(8058))
+
+                # Write to a temporary output first (in default_gdb) then replace existing only on success
+                timestamp = int(time.time())
+                tmp_out = os.path.join(default_gdb, f"tmp_extract_{safe_short}_{timestamp}_{uuid.uuid4().hex[:6]}")
+                try:
+                    if buffer_action and buffer_action.strip().upper() == "CLIP":
+                        # Clip to buffer -> write to tmp_out
+                        arcpy.analysis.Clip(temp_layer_name, buffer_fc, tmp_out)
+                    else:
+                        # INTERSECT behavior: copy the selected features as-is to tmp_out
+                        arcpy.management.CopyFeatures(temp_layer_name, tmp_out)
+                    step2_created_temp.add(tmp_out)
+                except Exception as e:
+                    arcpy.AddWarning(f"  - Error extracting features for '{short_name}': {e}\n{traceback.format_exc()}")
+                    try:
+                        arcpy.management.Delete(temp_layer_name)
+                        if temp_layer_name in step2_created_temp:
+                            step2_created_temp.discard(temp_layer_name)
+                    except:
+                        pass
+                    if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
+                        try:
+                            arcpy.management.Delete(buffer_fc)
+                            if buffer_fc in step2_created_temp:
+                                step2_created_temp.discard(buffer_fc)
+                        except:
+                            pass
+                    failed.append(short_name)
+                    # Clean up tmp_out if partially created
+                    try:
+                        if arcpy.Exists(tmp_out):
+                            arcpy.management.Delete(tmp_out)
+                            if tmp_out in step2_created_temp:
+                                step2_created_temp.discard(tmp_out)
+                    except:
+                        pass
+                    continue
+
+                # 2.4 Add additional attributes: ExtractDate & ExtractURL on tmp_out
+                try:
+                    if not arcpy.ListFields(tmp_out, "ExtractDate"):
+                        arcpy.management.AddField(tmp_out, "ExtractDate", "DATE")
+                    if not arcpy.ListFields(tmp_out, "ExtractURL"):
+                        arcpy.management.AddField(tmp_out, "ExtractURL", "TEXT", field_length=2048)
+                    now_dt = datetime.now()
+                    with arcpy.da.UpdateCursor(tmp_out, ["ExtractDate", "ExtractURL"]) as uc:
+                        for row in uc:
+                            row[0] = now_dt
+                            row[1] = service_url
+                            uc.updateRow(row)
+                except Exception as e:
+                    arcpy.AddWarning(f"  - Could not add/populate ExtractDate/ExtractURL for '{short_name}': {e}\n{traceback.format_exc()}")
+                    # proceed - this is non-fatal
+
+                # Now replace the existing out_fc only after tmp_out was successfully created
+                try:
+                    # If existing present and we are replacing, delete it first (now that tmp_out exists)
+                    if arcpy.Exists(out_fc):
+                        try:
+                            arcpy.management.Delete(out_fc)
+                            arcpy.AddMessage(f"  - Deleted existing {out_fc}")
+                        except Exception as e:
+                            arcpy.AddWarning(f"  - Could not delete existing output {out_fc}: {e}. Will attempt to clean up tmp and skip replacing.\n{traceback.format_exc()}")
+                            # cleanup tmp_out and move on
+                            try:
+                                arcpy.management.Delete(tmp_out)
+                                if tmp_out in step2_created_temp:
+                                    step2_created_temp.discard(tmp_out)
+                            except:
+                                pass
+                            failed.append(short_name)
+                            try:
+                                arcpy.management.Delete(temp_layer_name)
+                                if temp_layer_name in step2_created_temp:
+                                    step2_created_temp.discard(temp_layer_name)
+                            except:
+                                pass
+                            if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
+                                try:
+                                    arcpy.management.Delete(buffer_fc)
+                                    if buffer_fc in step2_created_temp:
+                                        step2_created_temp.discard(buffer_fc)
+                                except:
+                                    pass
+                            continue
+
+                        replaced.append(short_name)
+                    else:
+                        extracted_new.append(short_name)
+
+                    # Move tmp_out to final location by copying features (ensures correct path/name inside FD)
+                    arcpy.management.CopyFeatures(tmp_out, out_fc)
+                    # Remove tmp_out
+                    try:
+                        arcpy.management.Delete(tmp_out)
+                        if tmp_out in step2_created_temp:
+                            step2_created_temp.discard(tmp_out)
+                        step2_removed.append(tmp_out)
+                    except:
+                        pass
+
+                    arcpy.AddMessage(f"  ✓ Extracted '{short_name}' to {out_fc}")
+                    processed_outputs.append({"shortname": short_name, "path": out_fc, "style": style_file, "fd": feature_dataset_name, "safe_short": safe_short})
+
+                    # Add the output layer to "Site Details Map" (root) and apply the style
+                    try:
+                        if site_map:
+                            # Add data
+                            data_added = site_map.addDataFromPath(out_fc)
+                            top_added, added_child, parent_added = self._normalize_added(data_added)
+                            data_layer = added_child or top_added
+                            final_layer = data_layer
+                            try:
+                                data_layer.name = short_name
+                            except Exception:
+                                pass
+
+                            # Attempt to apply style if provided
+                            if style_file:
+                                style_path = os.path.expanduser(style_file)
+                                if not os.path.isabs(style_path):
+                                    try_paths = [
+                                        style_path,
+                                        os.path.join(os.path.dirname(arcpy.mp.ArcGISProject("CURRENT").filePath or ""), style_path),
+                                        os.path.join(default_gdb, style_path)
+                                    ]
+                                else:
+                                    try_paths = [style_path]
+
+                                applied = False
+                                for sp in try_paths:
+                                    try:
+                                        arcpy.AddMessage(f"  - Checking style candidate: {sp} (exists: {os.path.exists(sp)})")
+                                        if not os.path.exists(sp):
+                                            continue
+
+                                        # Try swap
+                                        final = self._apply_style_swap(site_map, data_layer, sp, display_name=short_name)
+                                        if final:
+                                            final_layer = final
+                                            applied = True
+                                            arcpy.AddMessage(f"  ✓ Applied style from '{sp}' by swapping for '{short_name}'.")
+                                            break
+                                        else:
+                                            # fallback to ApplySymbologyFromLayer
+                                            try:
+                                                arcpy.management.ApplySymbologyFromLayer(data_layer, sp)
+                                                final_layer = data_layer
+                                                applied = True
+                                                arcpy.AddMessage(f"  ✓ Applied style from '{sp}' using ApplySymbologyFromLayer for '{short_name}'.")
+                                                break
+                                            except Exception as e_f:
+                                                arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback also failed for '{sp}': {e_f}\n{traceback.format_exc()}")
+                                                try:
+                                                    if parent_added:
+                                                        site_map.removeLayer(parent_added)
+                                                except:
+                                                    pass
+                                                continue
+                                    except Exception:
+                                        continue
+                                if not applied:
+                                    arcpy.AddMessage(f"  - No valid style file found or applied for '{short_name}' (checked {len(try_paths)} locations).")
+
+                            # remove any duplicates that were pre-existing only
+                            try:
+                                self._cleanup_duplicates(site_map, final_layer, short_name, preexisting_names=preexisting_layer_names)
+                            except Exception:
+                                pass
+
+                    except Exception as add_err:
+                        arcpy.AddWarning(f"  - Could not add '{out_fc}' to 'Site Details Map': {add_err}\n{traceback.format_exc()}")
+                except Exception as e:
+                    arcpy.AddWarning(f"  - Could not move temporary extract to final location for '{short_name}': {e}\n{traceback.format_exc()}")
+                    failed.append(short_name)
+                    # attempt cleanup
+                    try:
+                        if arcpy.Exists(tmp_out):
+                            arcpy.management.Delete(tmp_out)
+                            if tmp_out in step2_created_temp:
+                                step2_created_temp.discard(tmp_out)
+                    except:
+                        pass
+                    try:
+                        arcpy.management.Delete(temp_layer_name)
+                        if temp_layer_name in step2_created_temp:
+                            step2_created_temp.discard(temp_layer_name)
+                    except:
+                        pass
+                    if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
+                        try:
+                            arcpy.management.Delete(buffer_fc)
+                            if buffer_fc in step2_created_temp:
+                                step2_created_temp.discard(buffer_fc)
+                        except:
+                            pass
+                    continue
+
+                # cleanup per-record temporary items
+                try:
+                    if arcpy.Exists(temp_layer_name):
+                        arcpy.management.Delete(temp_layer_name)
+                        if temp_layer_name in step2_created_temp:
+                            step2_created_temp.discard(temp_layer_name)
+                    if buffer_fc != study_area_fc and arcpy.Exists(buffer_fc):
+                        arcpy.management.Delete(buffer_fc)
+                        if buffer_fc in step2_created_temp:
+                            step2_created_temp.discard(buffer_fc)
+                except:
                     pass
 
-            # (Remaining Step 2 and class AddStandardProjectLayers code unchanged)
-            # The full file contains the unchanged Step 2 completion, cleanup and AddStandardProjectLayers class.
+            # 4. Create the SiteLotsReport table in default GDB
+            arcpy.AddMessage("Creating SiteLotsReport table...")
+            lots_fc = None
+            for po in processed_outputs:
+                if "lot" in po["shortname"].lower():
+                    lots_fc = po["path"]
+                    break
+
+            if not lots_fc:
+                arcpy.AddWarning("Could not find a 'Lots' layer among processed outputs to build SiteLotsReport. Skipping SiteLotsReport.")
+            else:
+                arcpy.AddMessage(f"  - Using Lots layer at {lots_fc}")
+                lots_layer = f"temp_lots_layer_{uuid.uuid4().hex[:6]}"
+                try:
+                    arcpy.management.MakeFeatureLayer(lots_fc, lots_layer)
+                    step2_created_temp.add(lots_layer)
+                    arcpy.management.SelectLayerByLocation(lots_layer, "WITHIN", study_area_fc)
+                    selected_count = int(arcpy.management.GetCount(lots_layer).getOutput(0))
+                    arcpy.AddMessage(f"  - {selected_count} lots within subject site.")
+                    report_table = os.path.join(default_gdb, "SiteLotsReport")
+                    if arcpy.Exists(report_table):
+                        arcpy.management.Delete(report_table)
+                    arcpy.management.CreateTable(default_gdb, "SiteLotsReport")
+                    arcpy.management.AddField(report_table, "Lot", "TEXT", field_length=50)
+                    arcpy.management.AddField(report_table, "Section", "TEXT", field_length=50)
+                    arcpy.management.AddField(report_table, "Plan", "TEXT", field_length=50)
+                    arcpy.management.AddField(report_table, "PlanLotArea", "DOUBLE")
+                    arcpy.management.AddField(report_table, "PlanLotAreaUnits", "TEXT", field_length=50)
+
+                    src_fields = [f.name for f in arcpy.ListFields(lots_fc)]
+                    def find_field(names):
+                        for name in names:
+                            for f in src_fields:
+                                if f.lower() == name.lower():
+                                    return f
+                        return None
+
+                    lot_f = find_field(["lotnumber", "lot_no", "lot"])
+                    section_f = find_field(["sectionnumber", "section_no", "section"])
+                    plan_f = find_field(["plannumber", "plan_number", "plan"])
+                    plan_area_f = find_field(["planlotarea", "plan_lot_area", "planlotarea"])
+                    plan_area_units_f = find_field(["planlotareaunits", "plan_lot_area_units", "planlotareaunits"])
+
+                    insert_fields = ["Lot", "Section", "Plan", "PlanLotArea", "PlanLotAreaUnits"]
+                    # Build a SearchCursor field list containing only existing fields
+                    src_field_list = [lot_f, section_f, plan_f, plan_area_f, plan_area_units_f]
+                    actual_src_fields = [f for f in src_field_list if f]
+                    if not actual_src_fields:
+                        arcpy.AddWarning("No suitable source fields found in Lots layer to build SiteLotsReport; skipping SiteLotsReport.")
+                    else:
+                        # Use searchcursor on selected lots (via lots_layer) so we only insert selected features
+                        with arcpy.da.InsertCursor(report_table, insert_fields) as ins, arcpy.da.SearchCursor(lots_layer, actual_src_fields) as src:
+                            for srow in src:
+                                # Map values back to the fixed insert order, filling defaults where source fields missing
+                                out_row = []
+                                for fld in [lot_f, section_f, plan_f, plan_area_f, plan_area_units_f]:
+                                    if fld:
+                                        # find index of fld in actual_src_fields
+                                        try:
+                                            idx = actual_src_fields.index(fld)
+                                            val = srow[idx]
+                                        except ValueError:
+                                            val = None
+                                    else:
+                                        val = None
+
+                                    # apply sensible defaults: text -> '', numeric -> None
+                                    if val is None:
+                                        if fld == plan_area_f:
+                                            out_row.append(None)
+                                        else:
+                                            out_row.append('')
+                                    else:
+                                        out_row.append(val)
+                                ins.insertRow(out_row)
+
+                    arcpy.AddMessage(f"  ✓ SiteLotsReport created: {report_table}")
+                except Exception as e:
+                    arcpy.AddWarning(f"  - Error creating SiteLotsReport: {e}\n{traceback.format_exc()}")
+                finally:
+                    try:
+                        if arcpy.Exists(lots_layer):
+                            arcpy.management.Delete(lots_layer)
+                            if lots_layer in step2_created_temp:
+                                step2_created_temp.discard(lots_layer)
+                    except:
+                        pass
+
+            # 5. Create the PCT_REPORT table (moved to external helper)
+            arcpy.AddMessage("Creating PCT_REPORT (external helper) ...")
+            pct_fc = None
+            for po in processed_outputs:
+                if "pct" in po["shortname"].lower() or "svtm_pct" in po["shortname"].lower():
+                    pct_fc = po["path"]
+                    break
+
+            if not pct_fc:
+                arcpy.AddWarning("Could not find an SVTM_PCT layer among processed outputs. Skipping PCT_REPORT.")
+            else:
+                if create_pct_report is not None:
+                    try:
+                        pct_table = create_pct_report(pct_fc, default_gdb, site_area_m2)
+                        if pct_table:
+                            arcpy.AddMessage(f"  ✓ PCT_Report created at {pct_table}")
+                        else:
+                            arcpy.AddWarning("  - PCT_Report helper ran but did not create a table.")
+                    except Exception as e:
+                        arcpy.AddWarning(f"  - Could not create PCT_Report via helper: {e}\n{traceback.format_exc()}")
+                else:
+                    arcpy.AddWarning("  - External pct_report helper not available; skipping PCT_Report creation.")
+
+            # Final summary of processing for QA (existing summary retained)
+            arcpy.AddMessage("\nExtraction summary:")
+            arcpy.AddMessage(f"  - Extracted new layers: {len(extracted_new)}")
+            if extracted_new:
+                arcpy.AddMessage(f"    {extracted_new}")
+            arcpy.AddMessage(f"  - Replaced (overwritten) layers: {len(replaced)}")
+            if replaced:
+                arcpy.AddMessage(f"    {replaced}")
+            arcpy.AddMessage(f"  - Skipped layers (existing and not requested to refresh): {len(skipped)}")
+            if skipped:
+                arcpy.AddMessage(f"    {skipped}")
+            arcpy.AddMessage(f"  - Failed layers: {len(failed)}")
+            if failed:
+                arcpy.AddMessage(f"    {failed}")
+
+            # Post-run diagnostic: print fallback qurls used for failed layers (if any)
+            if fallback_qurls_for_failed:
+                arcpy.AddMessage("\nFallback REST queries used for failed layers (for debugging):")
+                for item in fallback_qurls_for_failed:
+                    arcpy.AddMessage(f"  - Layer: {item.get('shortname')}  |  qurl: {item.get('qurl')}  |  error: {item.get('error')}")
+                arcpy.AddMessage("Tip: Copy the qurl into a browser or curl to inspect the service response.")
+
+            # Step 2: stricter cleanup of temp items created during this step
+            try:
+                arcpy.AddMessage("Cleaning up temporary data created during Step 2...")
+                # remove any in-memory or local temps we tracked
+                for t in list(step2_created_temp):
+                    try:
+                        if arcpy.Exists(t):
+                            arcpy.management.Delete(t)
+                            step2_removed.append(t)
+                        else:
+                            # layer names may not be "exists" addressable; still consider them removed
+                            step2_removed.append(t)
+                    except Exception as e:
+                        step2_failed_deletes.append({"path": t, "error": str(e)})
+                        continue
+
+                # Additionally remove leftovers in default_gdb with known prefixes (careful not to remove final outputs)
+                prefixes = ("tmp_extract_", "temp_dissolved_", "temp_property_", "tmp_", "temp_")
+                try:
+                    prev_ws = arcpy.env.workspace
+                    arcpy.env.workspace = default_gdb
+                    fc_list = arcpy.ListFeatureClasses() or []
+                    for fc in fc_list:
+                        try:
+                            if any(fc.lower().startswith(pref.lower()) for pref in prefixes):
+                                full = os.path.join(default_gdb, fc)
+                                # do not remove outputs we added
+                                if any(full == po["path"] for po in processed_outputs):
+                                    continue
+                                try:
+                                    arcpy.management.Delete(full)
+                                    step2_removed.append(full)
+                                except Exception as e_del:
+                                    step2_failed_deletes.append({"path": full, "error": str(e_del)})
+                        except Exception:
+                            pass
+                    tbls = arcpy.ListTables() or []
+                    for tbl in tbls:
+                        try:
+                            if any(tbl.lower().startswith(pref.lower()) for pref in prefixes):
+                                full = os.path.join(default_gdb, tbl)
+                                try:
+                                    arcpy.management.Delete(full)
+                                    step2_removed.append(full)
+                                except Exception as e_del:
+                                    step2_failed_deletes.append({"path": full, "error": str(e_del)})
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        arcpy.env.workspace = prev_ws
+                    except Exception:
+                        pass
+
+                if step2_removed:
+                    arcpy.AddMessage("Temporary data removed in Step 2:")
+                    for r in step2_removed:
+                        arcpy.AddMessage(f"  - {r}")
+                if step2_failed_deletes:
+                    arcpy.AddWarning("Some temporary items from Step 2 could not be deleted:")
+                    for fi in step2_failed_deletes:
+                        arcpy.AddWarning(f"  - {fi.get('path')}: {fi.get('error')}")
+            except Exception as e:
+                arcpy.AddWarning(f"Cleanup during Step 2 encountered errors: {e}\n{traceback.format_exc()}")
+
+            # FUNKY final summary block for Step 2
+            arcpy.AddMessage("\n" + ("✨" * 12))
+            arcpy.AddMessage("🌈 FUNKY FINAL REPORT — STEP 2 🌈")
+            arcpy.AddMessage("-" * 50)
+            arcpy.AddMessage(f"Project: {project_number}")
+            arcpy.AddMessage(f"Total reference records attempted: {len(features)}")
+            arcpy.AddMessage(f"New extractions: {len(extracted_new)}  |  Replacements: {len(replaced)}  |  Skipped: {len(skipped)}  |  Failed: {len(failed)}")
+            arcpy.AddMessage("\nDetailed lists:")
+            arcpy.AddMessage(f"  - Extracted: {extracted_new if extracted_new else 'None'}")
+            arcpy.AddMessage(f"  - Replaced: {replaced if replaced else 'None'}")
+            arcpy.AddMessage(f"  - Skipped: {skipped if skipped else 'None'}")
+            arcpy.AddMessage(f"  - Failed: {failed if failed else 'None'}")
+            arcpy.AddMessage("-" * 50)
+            arcpy.AddMessage(f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            arcpy.AddMessage("If anything failed, check warnings above and re-run with force re-query or enable overwrite as needed.")
+            arcpy.AddMessage(("✨" * 12) + "\n")
+
+            arcpy.AddMessage("\nSTEP 2 COMPLETE - Standard project layers extracted and reports created.")
 
         except Exception as e:
             arcpy.AddError(f"Error executing Step 2: {str(e)}\n{traceback.format_exc()}")
