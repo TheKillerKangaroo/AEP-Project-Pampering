@@ -4,10 +4,10 @@
  ▄    ▄   ▀    ▀▀█    ▀▀█                         ▄    ▄                                                 
  █  ▄▀  ▄▄▄      █      █     ▄▄▄    ▄ ▄▄         █  ▄▀   ▄▄▄   ▄ ▄▄    ▄▄▄▄   ▄▄▄    ▄ ▄▄   ▄▄▄    ▄▄▄  
  █▄█      █      █      █    █▀  █   █▀  ▀        █▄█    ▀   █  █▀  █  █▀ ▀█  ▀   █   █▀  ▀ █▀ ▀█  █▀ ▀█ 
- █  █▄    █      █      █    █▀▀▀▀   █            █  █▄  ▄▀▀▀█  █   █  █   █  ̴▀▀▀█   █     █   █  █   █ 
- █   ▀▄ ▄▄█▄▄    ▀▄▄    ▀▄▄  ▀█▄▄▀   █            █   ▀▄ ▀▄▄▀█  █   █  ▀█▄▀█  ▀▄▄▀█   █     ▀█▄█▀  ▀█▄[...]
+ █  █▄    █      █      █    █▀▀▀▀   █            █  █▄  ▄▀▀▀█  █   █  █   █   ▀▀▀█   █     █   █  █   █ 
+ █   ▀▄ ▄▄█▄▄    ▀▄▄    ▀▄▄  ▀█▄▄▀   █            █   ▀▄ ▀▄▄▀█  █   █  ▀█▄▀█  ▀▄▄▀█   █     ▀█▄█▀  ▀█▄█▀
                                                                         ▄  █                             
-                                                                         ▀▀                                                                                                                         [...]
+                                                                         ▀▀                                                                                                                         
                                                                                                     
     ___   
    ( _ )  
@@ -384,17 +384,33 @@ class CreateSubjectSite(object):
         # try to update connection properties on style_layer
         if conn_props:
             try:
-                style_layer.updateConnectionProperties(style_layer.connectionProperties, conn_props)
-                update_ok = True
+                # Only call updateConnectionProperties if supported by the layer object
+                update_func = getattr(style_layer, "updateConnectionProperties", None)
+                style_conn_props = getattr(style_layer, "connectionProperties", None)
+                if callable(update_func) and style_conn_props is not None:
+                    try:
+                        update_func(style_conn_props, conn_props)
+                        update_ok = True
+                    except Exception as e:
+                        arcpy.AddWarning(f"  - updateConnectionProperties failed for '{style_path}': {e}\n{traceback.format_exc()}")
+                        # attempt ApplySymbologyFromLayer fallback on the imported style layer
+                        try:
+                            arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
+                            update_ok = True
+                            arcpy.AddMessage(f"  • Applied symbology to imported style layer via ApplySymbologyFromLayer as workaround.")
+                        except Exception as e2:
+                            arcpy.AddWarning(f"  - ApplySymbologyFromLayer on imported style also failed: {e2}\n{traceback.format_exc()}")
+                else:
+                    # The imported style layer object doesn't expose updateConnectionProperties or lacks connectionProperties.
+                    arcpy.AddMessage(f"  - updateConnectionProperties not available on imported style; attempting ApplySymbologyFromLayer fallback.")
+                    try:
+                        arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
+                        update_ok = True
+                        arcpy.AddMessage(f"  • Applied symbology to imported style layer via ApplySymbologyFromLayer as workaround.")
+                    except Exception as e2:
+                        arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback also failed: {e2}\n{traceback.format_exc()}")
             except Exception as e:
-                arcpy.AddWarning(f"  - updateConnectionProperties failed for '{style_path}': {e}\n{traceback.format_exc()}")
-                # attempt ApplySymbologyFromLayer fallback on the imported style layer
-                try:
-                    arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
-                    update_ok = True
-                    arcpy.AddMessage(f"  • Applied symbology to imported style layer via ApplySymbologyFromLayer as workaround.")
-                except Exception as e2:
-                    arcpy.AddWarning(f"  - ApplySymbologyFromLayer on imported style also failed: {e2}\n{traceback.format_exc()}")
+                arcpy.AddWarning(f"  - Error while attempting connection update/fallback for '{style_path}': {e}\n{traceback.format_exc()}")
 
         # restore def query from data_layer (or provided)
         try:
@@ -860,27 +876,24 @@ class CreateSubjectSite(object):
                         final_psa = None
                         if os.path.exists(LAYERFILE_PATH):
                             applied = False
-                            # If we added the service layer, use its connectionProperties so the style points to the service
                             try:
-                                if psa_layer_obj and getattr(psa_layer_obj, "connectionProperties", None):
-                                    conn_source_layer = psa_layer_obj
-                                else:
-                                    # fallback: use the original data layer object if available
-                                    conn_source_layer = psa_layer_obj
+                                # prefer using the service-added layer's connectionProperties when available
+                                conn_source_layer = psa_layer_obj if (psa_layer_obj and getattr(psa_layer_obj, "connectionProperties", None)) else psa_layer_obj
 
-                                dq_for_psa = None
+                                # build a sensible definition query (best-effort)
                                 try:
                                     dq_for_psa = build_project_defq(project_number, layer=psa_layer_obj)
-                                except:
+                                except Exception:
                                     dq_for_psa = build_project_defq(project_number)
 
+                                # try the swap approach first
                                 final = self._apply_style_swap(map_obj, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=dq_for_psa)
                                 if final is not None:
                                     final_psa = final
                                     applied = True
                                     arcpy.AddMessage("  ✓ Applied standard Study Area symbology to PSA by swapping.")
                                 else:
-                                    # fallback to ApplySymbologyFromLayer on the data layer
+                                    # fallback to ApplySymbologyFromLayer on the layer we added
                                     try:
                                         arcpy.management.ApplySymbologyFromLayer(psa_layer_obj, LAYERFILE_PATH)
                                         final_psa = psa_layer_obj
@@ -1208,17 +1221,33 @@ class CreateSubjectSite(object):
                         pass
                     final_psa_layer = psa_layer_obj
                     if os.path.exists(LAYERFILE_PATH):
-                        final = self._apply_style_swap(site_map, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=build_project_defq(project_number, layer=psa_layer_obj))
-                        if final:
-                            final_psa_layer = final
-                            arcpy.AddMessage("  ✓ Applied standard Study Area symbology to PSA by swapping.")
-                        else:
+                        applied = False
+                        try:
+                            # prefer using the service-added layer's connectionProperties when available
+                            conn_source_layer = psa_layer_obj if (psa_layer_obj and getattr(psa_layer_obj, "connectionProperties", None)) else psa_layer_obj
+
+                            # build a sensible definition query (best-effort)
                             try:
-                                arcpy.management.ApplySymbologyFromLayer(psa_layer_obj, LAYERFILE_PATH)
-                                final_psa_layer = psa_layer_obj
-                                arcpy.AddMessage("  ✓ Applied standard Study Area symbology using ApplySymbologyFromLayer.")
-                            except Exception as e_fall:
-                                arcpy.AddWarning(f"  - PSA ApplySymbologyFromLayer fallback failed: {e_fall}\n{traceback.format_exc()}")
+                                dq_for_psa = build_project_defq(project_number, layer=psa_layer_obj)
+                            except Exception:
+                                dq_for_psa = build_project_defq(project_number)
+
+                            # try the swap approach first
+                            final = self._apply_style_swap(site_map, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=dq_for_psa)
+                            if final is not None:
+                                final_psa_layer = final
+                                applied = True
+                                arcpy.AddMessage("  ✓ Applied standard Study Area symbology to PSA by swapping.")
+                            else:
+                                try:
+                                    arcpy.management.ApplySymbologyFromLayer(psa_layer_obj, LAYERFILE_PATH)
+                                    final_psa_layer = psa_layer_obj
+                                    applied = True
+                                    arcpy.AddMessage("  ✓ Applied standard Study Area symbology using ApplySymbologyFromLayer.")
+                                except Exception as e_fall:
+                                    arcpy.AddWarning(f"  - PSA ApplySymbologyFromLayer fallback failed: {e_fall}\n{traceback.format_exc()}")
+                        except Exception as eaddpsa:
+                            arcpy.AddWarning(f"  - Could not apply standard symbology to PSA: {eaddpsa}\n{traceback.format_exc()}")
                     try:
                         dq = build_project_defq(project_number, layer=final_psa_layer)
                         if final_psa_layer and final_psa_layer.supports("DEFINITIONQUERY"):
