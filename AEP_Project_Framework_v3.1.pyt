@@ -4,12 +4,20 @@
  ▄    ▄   ▀    ▀▀█    ▀▀█                         ▄    ▄                                                 
  █  ▄▀  ▄▄▄      █      █     ▄▄▄    ▄ ▄▄         █  ▄▀   ▄▄▄   ▄ ▄▄    ▄▄▄▄   ▄▄▄    ▄ ▄▄   ▄▄▄    ▄▄▄  
  █▄█      █      █      █    █▀  █   █▀  ▀        █▄█    ▀   █  █▀  █  █▀ ▀█  ▀   █   █▀  ▀ █▀ ▀█  █▀ ▀█ 
- █  █▄    █      █      █    █▀▀▀▀   █            █  █▄  ▄▀▀▀█  █   █  █   █  ▄▀▀▀█   █     █   █  █   █ 
- █   ▀▄ ▄▄█▄▄    ▀▄▄    ▀▄▄  ▀█▄▄▀   █            █   ▀▄ ▀▄▄▀█  █   █  ▀█▄▀█  ▀▄▄▀█   █     ▀█▄█▀  ▀█▄█▀ 
+ █  █▄    █      █      █    █▀▀▀▀   █            █  █▄  ▄▀▀▀█  █   █  █   █  ̴▀▀▀█   █     █   █  █   █ 
+ █   ▀▄ ▄▄█▄▄    ▀▄▄    ▀▄▄  ▀█▄▄▀   █            █   ▀▄ ▀▄▄▀█  █   █  ▀█▄▀█  ▀▄▄▀█   █     ▀█▄█▀  ▀█▄[...]
                                                                         ▄  █                             
-                                                                         ▀▀                                                                                                                                  
+                                                                         ▀▀                                                                                                                         [...]
                                                                                                     
-                                                                                                    
+    ___   
+   ( _ )  
+   / _ \/\
+  | (_>  <
+   \___/\/
+          
+          
+
+
                 .......   ........                                                                  
             .:---------------------:.                  .%%%%%%.    :%%%%%%%%%%%  #%%%%%%%#+         
           .---------------------------:.               :%%%%%%:    :%%%%%%%%%%%  #%%%%%%%%%%:       
@@ -41,6 +49,7 @@ from datetime import datetime
 import time
 import re
 import uuid
+import traceback
 
 # Global Path to Layer File (Standard Styling)
 LAYERFILE_PATH = r"G:\Shared drives\99.3 GIS Admin\Production\Layer Files\AEP - Study Area.lyrx"
@@ -77,31 +86,31 @@ def build_project_defq(project_number, layer=None):
                     if ftype in ("smallinteger", "integer", "single", "double", "oid", "long"):
                         try:
                             if pn.isdigit():
-                                return f"project_number = {int(pn)} AND EndDate IS Null"
+                                return f"project_number = {int(pn)} AND EndDate IS NULL"
                             fv = float(pn)
                             if fv.is_integer():
-                                return f"project_number = {int(fv)} AND EndDate IS Null"
+                                return f"project_number = {int(fv)} AND EndDate IS NULL"
                         except Exception:
                             # If casting fails, fall back to quoted
-                            return f"project_number = {quoted(pn)} AND EndDate IS Null"
+                            return f"project_number = {quoted(pn)} AND EndDate IS NULL"
                     else:
                         # text-like field -> quote
-                        return f"project_number = {quoted(pn)} AND EndDate IS Null"
+                        return f"project_number = {quoted(pn)} AND EndDate IS NULL"
         except Exception:
             # if field inspection fails, fall back to value-based below
             pass
 
     # No layer or inspection failed -> fall back to value-based detection
     if pn.isdigit():
-        return f"project_number = {int(pn)} AND EndDate IS Null"
+        return f"project_number = {int(pn)} AND EndDate IS NULL"
     try:
         f = float(pn)
         if f.is_integer():
-            return f"project_number = {int(f)} AND EndDate IS Null"
+            return f"project_number = {int(f)} AND EndDate IS NULL"
     except Exception:
         pass
 
-    return f"project_number = {quoted(pn)} AND EndDate IS Null"
+    return f"project_number = {quoted(pn)} AND EndDate IS NULL"
 
 
 class Toolbox(object):
@@ -314,6 +323,24 @@ class CreateSubjectSite(object):
         Returns final_layer (the styled layer) or None on complete failure.
         """
         final_layer = data_layer
+
+        # Attempt to inspect the layerfile first to find a preferred inner layer name (best-effort)
+        preferred_layer_name = None
+        try:
+            if os.path.exists(style_path):
+                try:
+                    lf = arcpy.mp.LayerFile(style_path)
+                    lf_layers = lf.listLayers()
+                    for l in lf_layers:
+                        lname = getattr(l, "name", None)
+                        if getattr(l, "connectionProperties", None) is not None or not getattr(l, "isGroupLayer", False):
+                            preferred_layer_name = lname
+                            break
+                except Exception:
+                    preferred_layer_name = None
+        except Exception:
+            preferred_layer_name = None
+
         try:
             added = site_map.addDataFromPath(style_path)
         except Exception as e:
@@ -321,6 +348,19 @@ class CreateSubjectSite(object):
             return None
 
         top, style_layer, parent = self._normalize_added(added)
+        # If preferred layer name detected, try to find that child under top
+        try:
+            if preferred_layer_name and top and getattr(top, "listLayers", None):
+                try:
+                    for c in top.listLayers():
+                        if getattr(c, "name", "") == preferred_layer_name:
+                            style_layer = c
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         if style_layer is None:
             arcpy.AddWarning(f"  - Imported style produced no usable layer object: {style_path}")
             try:
@@ -347,14 +387,14 @@ class CreateSubjectSite(object):
                 style_layer.updateConnectionProperties(style_layer.connectionProperties, conn_props)
                 update_ok = True
             except Exception as e:
-                arcpy.AddWarning(f"  - updateConnectionProperties failed for '{style_path}': {e}")
+                arcpy.AddWarning(f"  - updateConnectionProperties failed for '{style_path}': {e}\n{traceback.format_exc()}")
                 # attempt ApplySymbologyFromLayer fallback on the imported style layer
                 try:
                     arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
                     update_ok = True
                     arcpy.AddMessage(f"  • Applied symbology to imported style layer via ApplySymbologyFromLayer as workaround.")
                 except Exception as e2:
-                    arcpy.AddWarning(f"  - ApplySymbologyFromLayer on imported style also failed: {e2}")
+                    arcpy.AddWarning(f"  - ApplySymbologyFromLayer on imported style also failed: {e2}\n{traceback.format_exc()}")
 
         # restore def query from data_layer (or provided)
         try:
@@ -522,7 +562,7 @@ class CreateSubjectSite(object):
 
             # Create point
             geocoded_point = arcpy.PointGeometry(arcpy.Point(loc['x'], loc['y']), arcpy.SpatialReference(4326))
-            temp_geocoded = os.path.join("memory", f"geocoded_point_{run_uuid}")
+            temp_geocoded = os.path.join("in_memory", f"geocoded_point_{run_uuid}")
             arcpy.management.CopyFeatures(geocoded_point, temp_geocoded)
             created_temp_paths.add(temp_geocoded)
 
@@ -548,7 +588,7 @@ class CreateSubjectSite(object):
                     layer_sr = getattr(desc, "spatialReference", None)
 
                     # create a copy of the geocoded point and project to the layer SR if needed
-                    pt_in = os.path.join("memory", f"temp_geocode_copy_{run_uuid}")
+                    pt_in = os.path.join("in_memory", f"temp_geocode_copy_{run_uuid}")
                     if arcpy.Exists(pt_in):
                         try: arcpy.management.Delete(pt_in)
                         except: pass
@@ -558,7 +598,7 @@ class CreateSubjectSite(object):
                     proj_pt = pt_in
                     if layer_sr and getattr(layer_sr, "factoryCode", None) and layer_sr.factoryCode != 4326:
                         # project into cadastre SR in memory
-                        proj_pt = os.path.join("memory", f"temp_geocode_proj_{run_uuid}")
+                        proj_pt = os.path.join("in_memory", f"temp_geocode_proj_{run_uuid}")
                         try:
                             if arcpy.Exists(proj_pt):
                                 try: arcpy.management.Delete(proj_pt)
@@ -570,7 +610,7 @@ class CreateSubjectSite(object):
                         created_temp_paths.add(proj_pt)
 
                     # buffer the point a small distance (2 metres) using GEODESIC for safety
-                    buf_fc = os.path.join("memory", f"temp_geocode_buf_{run_uuid}")
+                    buf_fc = os.path.join("in_memory", f"temp_geocode_buf_{run_uuid}")
                     if arcpy.Exists(buf_fc):
                         try: arcpy.management.Delete(buf_fc)
                         except: pass
@@ -772,7 +812,7 @@ class CreateSubjectSite(object):
                         arcpy.management.SelectLayerByAttribute(temp_service_layer_name, "NEW_SELECTION", where_clause)
                         sel_count = int(arcpy.management.GetCount(temp_service_layer_name).getOutput(0))
                         if sel_count > 0:
-                            study_area_mem = os.path.join("memory", f"study_area_{project_number}_{run_uuid}")
+                            study_area_mem = os.path.join("in_memory", f"study_area_{project_number}_{run_uuid}")
                             if arcpy.Exists(study_area_mem):
                                 try:
                                     arcpy.management.Delete(study_area_mem)
@@ -847,9 +887,9 @@ class CreateSubjectSite(object):
                                         applied = True
                                         arcpy.AddMessage("  ✓ Applied standard Study Area symbology using ApplySymbologyFromLayer.")
                                     except Exception as e_sym:
-                                        arcpy.AddWarning(f"  - Could not apply standard symbology to Project Study Area: {e_sym}")
+                                        arcpy.AddWarning(f"  - Could not apply standard symbology to Project Study Area: {e_sym}\n{traceback.format_exc()}")
                             except Exception as e:
-                                arcpy.AddWarning(f"  - Error while attempting to apply style to PSA: {e}")
+                                arcpy.AddWarning(f"  - Error while attempting to apply style to PSA: {e}\n{traceback.format_exc()}")
 
                             # ensure definition query is applied using layer-aware builder
                             try:
@@ -862,11 +902,11 @@ class CreateSubjectSite(object):
                             arcpy.AddWarning("  - PSA layerfile not found; PSA added without standard styling.")
 
                     except Exception as e:
-                        arcpy.AddWarning(f"Map update for PSA failed: {e}")
+                        arcpy.AddWarning(f"Map update for PSA failed: {e}\n{traceback.format_exc()}")
                 else:
                     arcpy.AddWarning("No active map to add PSA.")
             except Exception as e:
-                arcpy.AddWarning(f"Could not update map: {str(e)}")
+                arcpy.AddWarning(f"Could not update map: {str(e)}\n{traceback.format_exc()}")
 
             # After adding to service and map: perform stricter cleanup of temporary local copies that are purely transient
             try:
@@ -952,7 +992,7 @@ class CreateSubjectSite(object):
                     for fi in failed_temp_deletes:
                         arcpy.AddWarning(f"  - {fi.get('path')}: {fi.get('error')}")
             except Exception as e:
-                arcpy.AddWarning(f"Cleanup during Step 1 encountered errors: {e}")
+                arcpy.AddWarning(f"Cleanup during Step 1 encountered errors: {e}\n{traceback.format_exc()}")
 
             arcpy.AddMessage("\nSTEP 1 COMPLETE.")
 
@@ -964,7 +1004,7 @@ class CreateSubjectSite(object):
                     # and so the script is not accidentally connected to the temporary default-gdb table like temp_dissolved.
                     self._run_step2_with_study_area(aprx, study_area_for_step2, project_number, overwrite_flag, force_requery)
                 except Exception as e:
-                    arcpy.AddError(f"Error while running Step 2 after Step 1: {e}")
+                    arcpy.AddError(f"Error while running Step 2 after Step 1: {e}\n{traceback.format_exc()}")
             else:
                 arcpy.AddMessage("Step 2 was not requested to run automatically. Process completed after Step 1.")
 
@@ -986,7 +1026,6 @@ class CreateSubjectSite(object):
 
         except Exception as e:
             arcpy.AddError(f"\n✗ Error: {str(e)}")
-            import traceback
             arcpy.AddError(traceback.format_exc())
         return
 
@@ -1179,7 +1218,7 @@ class CreateSubjectSite(object):
                                 final_psa_layer = psa_layer_obj
                                 arcpy.AddMessage("  ✓ Applied standard Study Area symbology using ApplySymbologyFromLayer.")
                             except Exception as e_fall:
-                                arcpy.AddWarning(f"  - PSA ApplySymbologyFromLayer fallback failed: {e_fall}")
+                                arcpy.AddWarning(f"  - PSA ApplySymbologyFromLayer fallback failed: {e_fall}\n{traceback.format_exc()}")
                     try:
                         dq = build_project_defq(project_number, layer=final_psa_layer)
                         if final_psa_layer and final_psa_layer.supports("DEFINITIONQUERY"):
@@ -1188,7 +1227,7 @@ class CreateSubjectSite(object):
                     except Exception:
                         pass
                 except Exception as eaddpsa:
-                    arcpy.AddWarning(f"  - Could not add Project Study Area layer to 'Site Details Map': {eaddpsa}")
+                    arcpy.AddWarning(f"  - Could not add Project Study Area layer to 'Site Details Map': {eaddpsa}\n{traceback.format_exc()}")
                 # After initial PSA add, update preexisting names (PSA is now present but it's considered "new")
                 try:
                     preexisting_layer_names = {getattr(lyr, "name", "") for lyr in site_map.listLayers() if getattr(lyr, "name", "")}
@@ -1269,7 +1308,7 @@ class CreateSubjectSite(object):
                     distance_m = 0.0
 
                 if distance_m > 0:
-                    buffer_fc = os.path.join("memory", f"buf_{safe_short}_{int(time.time())}")
+                    buffer_fc = os.path.join("in_memory", f"buf_{safe_short}_{int(time.time())}")
                     if arcpy.Exists(buffer_fc):
                         arcpy.management.Delete(buffer_fc)
                     arcpy.analysis.Buffer(study_area_fc, buffer_fc, f"{distance_m} Meters", method="GEODESIC")
@@ -1286,7 +1325,7 @@ class CreateSubjectSite(object):
                     made_layer = True
                     step2_created_temp.add(temp_layer_name)
                 except Exception as e:
-                    arcpy.AddWarning(f"  - Could not make feature layer from URL '{service_url}': {e}")
+                    arcpy.AddWarning(f"  - Could not make feature layer from URL '{service_url}': {e}\n{traceback.format_exc()}")
                     # we'll try the REST fallback below
 
                 # Attempt a spatial selection. If it fails, fall back to a REST query for OBJECTIDs and recreate the layer with a WHERE clause.
@@ -1298,7 +1337,7 @@ class CreateSubjectSite(object):
                     else:
                         raise Exception("Layer creation failed; attempting REST fallback")
                 except Exception as sel_err:
-                    arcpy.AddWarning(f"  - Selection by location failed for '{short_name}': {sel_err}")
+                    arcpy.AddWarning(f"  - Selection by location failed for '{short_name}': {sel_err}\n{traceback.format_exc()}")
 
                     # Fetch and print a little service metadata (best-effort) to help debugging
                     try:
@@ -1406,7 +1445,7 @@ class CreateSubjectSite(object):
 
                             except Exception as e:
                                 last_err = e
-                                arcpy.AddWarning(f"  - REST fallback HTTP error on attempt {attempt+1}: {e}")
+                                arcpy.AddWarning(f"  - REST fallback HTTP error on attempt {attempt+1}: {e}\n{traceback.format_exc()}")
                                 attempt += 1
                                 time.sleep(3)
 
@@ -1435,7 +1474,7 @@ class CreateSubjectSite(object):
                             arcpy.management.MakeFeatureLayer(service_url, temp_layer_name, where_clause=where_ids)
                             step2_created_temp.add(temp_layer_name)
                         except Exception as e2:
-                            arcpy.AddWarning(f"  - Could not create filtered layer from service for '{short_name}': {e2}")
+                            arcpy.AddWarning(f"  - Could not create filtered layer from service for '{short_name}': {e2}\n{traceback.format_exc()}")
                             failed.append(short_name)
                             # ensure no leftover
                             try:
@@ -1453,7 +1492,7 @@ class CreateSubjectSite(object):
                         selection_succeeded = True
 
                     except Exception as fb_err:
-                        arcpy.AddWarning(f"  - REST fallback failed for '{short_name}': {fb_err}")
+                        arcpy.AddWarning(f"  - REST fallback failed for '{short_name}': {fb_err}\n{traceback.format_exc()}")
                         # nothing more we can do for this reference record
                         failed.append(short_name)
                         # ensure no leftover
@@ -1529,7 +1568,7 @@ class CreateSubjectSite(object):
                         arcpy.management.CopyFeatures(temp_layer_name, tmp_out)
                     step2_created_temp.add(tmp_out)
                 except Exception as e:
-                    arcpy.AddWarning(f"  - Error extracting features for '{short_name}': {e}")
+                    arcpy.AddWarning(f"  - Error extracting features for '{short_name}': {e}\n{traceback.format_exc()}")
                     try:
                         arcpy.management.Delete(temp_layer_name)
                         if temp_layer_name in step2_created_temp:
@@ -1567,7 +1606,7 @@ class CreateSubjectSite(object):
                             row[1] = service_url
                             uc.updateRow(row)
                 except Exception as e:
-                    arcpy.AddWarning(f"  - Could not add/populate ExtractDate/ExtractURL for '{short_name}': {e}")
+                    arcpy.AddWarning(f"  - Could not add/populate ExtractDate/ExtractURL for '{short_name}': {e}\n{traceback.format_exc()}")
                     # proceed - this is non-fatal
 
                 # Now replace the existing out_fc only after tmp_out was successfully created
@@ -1578,7 +1617,7 @@ class CreateSubjectSite(object):
                             arcpy.management.Delete(out_fc)
                             arcpy.AddMessage(f"  - Deleted existing {out_fc}")
                         except Exception as e:
-                            arcpy.AddWarning(f"  - Could not delete existing output {out_fc}: {e}. Will attempt to clean up tmp and skip replacing.")
+                            arcpy.AddWarning(f"  - Could not delete existing output {out_fc}: {e}. Will attempt to clean up tmp and skip replacing.\n{traceback.format_exc()}")
                             # cleanup tmp_out and move on
                             try:
                                 arcpy.management.Delete(tmp_out)
@@ -1668,7 +1707,7 @@ class CreateSubjectSite(object):
                                                 arcpy.AddMessage(f"  ✓ Applied style from '{sp}' using ApplySymbologyFromLayer for '{short_name}'.")
                                                 break
                                             except Exception as e_f:
-                                                arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback also failed for '{sp}': {e_f}")
+                                                arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback also failed for '{sp}': {e_f}\n{traceback.format_exc()}")
                                                 try:
                                                     if parent_added:
                                                         site_map.removeLayer(parent_added)
@@ -1687,9 +1726,9 @@ class CreateSubjectSite(object):
                                 pass
 
                     except Exception as add_err:
-                        arcpy.AddWarning(f"  - Could not add '{out_fc}' to 'Site Details Map': {add_err}")
+                        arcpy.AddWarning(f"  - Could not add '{out_fc}' to 'Site Details Map': {add_err}\n{traceback.format_exc()}")
                 except Exception as e:
-                    arcpy.AddWarning(f"  - Could not move temporary extract to final location for '{short_name}': {e}")
+                    arcpy.AddWarning(f"  - Could not move temporary extract to final location for '{short_name}': {e}\n{traceback.format_exc()}")
                     failed.append(short_name)
                     # attempt cleanup
                     try:
@@ -1805,7 +1844,7 @@ class CreateSubjectSite(object):
 
                     arcpy.AddMessage(f"  ✓ SiteLotsReport created: {report_table}")
                 except Exception as e:
-                    arcpy.AddWarning(f"  - Error creating SiteLotsReport: {e}")
+                    arcpy.AddWarning(f"  - Error creating SiteLotsReport: {e}\n{traceback.format_exc()}")
                 finally:
                     try:
                         if arcpy.Exists(lots_layer):
@@ -1967,7 +2006,7 @@ class CreateSubjectSite(object):
                     for fi in step2_failed_deletes:
                         arcpy.AddWarning(f"  - {fi.get('path')}: {fi.get('error')}")
             except Exception as e:
-                arcpy.AddWarning(f"Cleanup during Step 2 encountered errors: {e}")
+                arcpy.AddWarning(f"Cleanup during Step 2 encountered errors: {e}\n{traceback.format_exc()}")
 
             # FUNKY final summary block for Step 2
             arcpy.AddMessage("\n" + ("✨" * 12))
@@ -1989,9 +2028,7 @@ class CreateSubjectSite(object):
             arcpy.AddMessage("\nSTEP 2 COMPLETE - Standard project layers extracted and reports created.")
 
         except Exception as e:
-            arcpy.AddError(f"Error executing Step 2: {str(e)}")
-            import traceback
-            arcpy.AddError(traceback.format_exc())
+            arcpy.AddError(f"Error executing Step 2: {str(e)}\n{traceback.format_exc()}")
         return
 
 
@@ -2093,7 +2130,7 @@ class AddStandardProjectLayers(object):
         sr = query_result.get('spatialReference') or {"wkid": 4326}
         polygon = arcpy.AsShape({"rings": feat['geometry']['rings'], "spatialReference": sr}, True)
 
-        temp_fc = os.path.join("memory", f"study_area_{project_number}_{uuid.uuid4().hex[:6]}")
+        temp_fc = os.path.join("in_memory", f"study_area_{project_number}_{uuid.uuid4().hex[:6]}")
         arcpy.management.CopyFeatures(polygon, temp_fc)
 
         # Add basic attributes back (simplified)
@@ -2120,7 +2157,7 @@ class AddStandardProjectLayers(object):
         except Exception as e:
             # don't block the UI; show a warning to help troubleshooting
             try:
-                arcpy.AddWarning(f"Could not refresh project number list from service: {e}")
+                arcpy.AddWarning(f"Could not refresh project number list from service: {e}\n{traceback.format_exc()}")
             except:
                 pass
         return
@@ -2153,7 +2190,7 @@ class AddStandardProjectLayers(object):
                 else:
                     arcpy.AddMessage(f"Project number '{project_number}' confirmed in service ({len(latest_list)} total projects).")
             except Exception as e:
-                arcpy.AddWarning(f"Could not refresh project number list before execution: {e}")
+                arcpy.AddWarning(f"Could not refresh project number list before execution: {e}\n{traceback.format_exc()}")
 
             # 1. Retrieve the study area (only active records: EndDate IS NULL)
             arcpy.AddMessage(f"Retrieving study area for Project {project_number} (EndDate IS NULL)...")
@@ -2175,7 +2212,5 @@ class AddStandardProjectLayers(object):
             arcpy.AddMessage("\nSUCCESS - Project Layers Added.")
 
         except Exception as e:
-            arcpy.AddError(f"Error executing Step 2: {str(e)}")
-            import traceback
-            arcpy.AddError(traceback.format_exc())
+            arcpy.AddError(f"Error executing Step 2: {str(e)}\n{traceback.format_exc()}")
         return
