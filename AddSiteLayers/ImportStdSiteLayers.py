@@ -6,7 +6,7 @@
 # produced elsewhere (e.g., from CreateSiteByProperty.run_create_site) or it will fetch the
 # authoritative study area for a given project number from the Project_Study_Area service.
 #
-# Dependencies: arcpy, Python standard libs (os, json, urllib, datetime, time, re, uuid, traceback)
+# Dependencies: arcpy, Python standard libs (os, json, urllib, datetime, time, re, uuid, traceback, tempfile)
 
 import arcpy
 import os
@@ -18,12 +18,7 @@ import time
 import re
 import uuid
 import traceback
-
-# Optional external PCT report helper (kept for parity with original toolbox)
-try:
-    from pct_report import create_pct_report
-except Exception:
-    create_pct_report = None
+import tempfile
 
 # Styling layerfile (same as original)
 LAYERFILE_PATH = r"G:\Shared drives\99.3 GIS Admin\Production\Layer Files\AEP - Study Area.lyrx"
@@ -126,10 +121,10 @@ def _apply_style_swap(site_map, data_layer, style_path, display_name=None, set_d
     - import style (addDataFromPath)
     - extract actual style sublayer
     - updateConnectionProperties to point at data_layer connection
-    - if updateConnectionProperties fails, try ApplySymbologyFromLayer on the style layer
+    - if updateConnectionProperties fails, try ApplySymbologyFromLayer on the data_layer
     - set definition query on style layer if provided and supported
-    - remove original data_layer and any parent imported group
-    Returns final_layer (the styled layer) or None on complete failure.
+    - remove original data_layer and any parent imported group (only if style layer is successfully re-pointed)
+    Returns final_layer (the styled layer or data_layer if only symbology applied) or None on complete failure.
     """
     final_layer = data_layer
 
@@ -202,25 +197,25 @@ def _apply_style_swap(site_map, data_layer, style_path, display_name=None, set_d
                 except AttributeError as ae:
                     arcpy.AddMessage(f"  - updateConnectionProperties not supported by this layer object: {ae}")
                     try:
-                        arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
+                        arcpy.management.ApplySymbologyFromLayer(data_layer, style_path)
                         update_ok = True
-                        arcpy.AddMessage("  • Applied symbology to imported style layer via ApplySymbologyFromLayer (fallback).")
+                        arcpy.AddMessage("  • Applied symbology to data layer via ApplySymbologyFromLayer (fallback).")
                     except Exception as e2:
                         arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback failed: {e2}")
                 except Exception as e:
                     arcpy.AddWarning(f"  - updateConnectionProperties failed: {e}")
                     try:
-                        arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
+                        arcpy.management.ApplySymbologyFromLayer(data_layer, style_path)
                         update_ok = True
-                        arcpy.AddMessage("  • Applied symbology to imported style layer via ApplySymbologyFromLayer (fallback).")
+                        arcpy.AddMessage("  • Applied symbology to data layer via ApplySymbologyFromLayer (fallback).")
                     except Exception as e2:
                         arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback failed: {e2}")
             else:
                 arcpy.AddMessage("  - updateConnectionProperties not available on imported style; attempting ApplySymbologyFromLayer fallback.")
                 try:
-                    arcpy.management.ApplySymbologyFromLayer(style_layer, style_path)
+                    arcpy.management.ApplySymbologyFromLayer(data_layer, style_path)
                     update_ok = True
-                    arcpy.AddMessage(f"  • Applied symbology to imported style layer via ApplySymbologyFromLayer as workaround.")
+                    arcpy.AddMessage(f"  • Applied symbology to data layer via ApplySymbologyFromLayer as workaround.")
                 except Exception as e2:
                     arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback also failed: {e2}\n{traceback.format_exc()}")
         except Exception as e:
@@ -242,14 +237,34 @@ def _apply_style_swap(site_map, data_layer, style_path, display_name=None, set_d
     except Exception:
         pass
 
-    # remove original data layer (only after we've attempted to apply symbology)
+    # If we successfully updated the style layer's connection to point to the data layer,
+    # remove the original data layer (only after we've attempted to apply symbology)
     try:
-        site_map.removeLayer(data_layer)
+        if update_ok:
+            try:
+                site_map.removeLayer(data_layer)
+            except Exception:
+                try:
+                    data_layer.visible = False
+                except:
+                    pass
+        else:
+            # If we couldn't update the imported style layer's connection, prefer to keep data_layer
+            # and remove the imported style wrapper to avoid leaving a disconnected layer in the map.
+            try:
+                if parent and parent is not style_layer:
+                    try:
+                        site_map.removeLayer(parent)
+                    except Exception:
+                        pass
+                try:
+                    site_map.removeLayer(style_layer)
+                except Exception:
+                    pass
+            except Exception:
+                pass
     except Exception:
-        try:
-            data_layer.visible = False
-        except:
-            pass
+        pass
 
     # remove parent import wrapper if it's a group and different from style_layer
     try:
@@ -261,7 +276,7 @@ def _apply_style_swap(site_map, data_layer, style_path, display_name=None, set_d
     except Exception:
         pass
 
-    final_layer = style_layer
+    final_layer = style_layer if update_ok else data_layer
     return final_layer
 
 
@@ -424,6 +439,88 @@ def _get_study_area_by_project_number(target_layer_url, token, project_number):
     return temp_fc
 
 
+def _add_fc_to_map_via_layerfile(site_map, fc_path, display_name=None):
+    """
+    Add a feature class to the map by creating a temporary feature layer then saving it
+    to a temporary layer file and adding that layerfile to the map. This avoids addDataFromPath's
+    AUTOMATIC web_service_type inference which can fail for some datasource strings.
+    Returns the added map layer object, or None on failure.
+    """
+    temp_layer_name = f"tmp_add_{uuid.uuid4().hex[:6]}"
+    temp_lyrx = None
+    added_layer = None
+    try:
+        # Create an ephemeral feature layer
+        arcpy.management.MakeFeatureLayer(fc_path, temp_layer_name)
+        # Save to a temporary layer file
+        tf = tempfile.gettempdir()
+        temp_lyrx = os.path.join(tf, f"tmp_{uuid.uuid4().hex[:8]}.lyrx")
+        try:
+            if arcpy.Exists(temp_lyrx):
+                try:
+                    arcpy.management.Delete(temp_lyrx)
+                except Exception:
+                    pass
+            arcpy.management.SaveToLayerFile(temp_layer_name, temp_lyrx, "ABSOLUTE")
+            # Add via LayerFile which avoids AUTOMATIC web_service_type problems
+            lf = arcpy.mp.LayerFile(temp_lyrx)
+            try:
+                added = site_map.addLayer(lf)
+            except Exception:
+                # fallback to addDataFromPath on the layerfile
+                added = site_map.addDataFromPath(temp_lyrx)
+            top, child, parent = _normalize_added(added)
+            added_layer = child or top
+        except Exception as e:
+            arcpy.AddWarning(f"  - Could not save/add temporary layerfile for '{fc_path}': {e}\n{traceback.format_exc()}")
+            # fallback: try addDataFromPath directly on the fc_path
+            try:
+                added = site_map.addDataFromPath(fc_path)
+                top, child, parent = _normalize_added(added)
+                added_layer = child or top
+            except Exception as e2:
+                arcpy.AddWarning(f"  - Fallback addDataFromPath also failed for '{fc_path}': {e2}\n{traceback.format_exc()}")
+                added_layer = None
+    except Exception as e:
+        arcpy.AddWarning(f"  - Could not create temporary feature layer for '{fc_path}': {e}\n{traceback.format_exc()}")
+        try:
+            # final fallback
+            added = site_map.addDataFromPath(fc_path)
+            top, child, parent = _normalize_added(added)
+            added_layer = child or top
+        except Exception as e2:
+            arcpy.AddWarning(f"  - Final fallback addDataFromPath failed for '{fc_path}': {e2}\n{traceback.format_exc()}")
+            added_layer = None
+    finally:
+        # delete the in-memory temp layer if it exists
+        try:
+            if arcpy.Exists(temp_layer_name):
+                arcpy.management.Delete(temp_layer_name)
+        except Exception:
+            pass
+        # remove temporary layer file
+        try:
+            if temp_lyrx and os.path.exists(temp_lyrx):
+                try:
+                    os.remove(temp_lyrx)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # rename if requested
+    try:
+        if added_layer and display_name:
+            try:
+                added_layer.name = display_name
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return added_layer
+
+
 def run_import_std_site_layers(project_number, overwrite_flag=False, force_requery=False, study_area_fc=None):
     """
     Main entrypoint for Step 2 processing.
@@ -524,43 +621,72 @@ def run_import_std_site_layers(project_number, overwrite_flag=False, force_reque
 
         # If we created the map just now, add the PSA first and style it (so it sits at root).
         if site_map_created_in_run and site_map:
+            psa_layer_obj = None
+            psa_temp_copy = None
             try:
-                psa_added = site_map.addDataFromPath(study_area_fc)
-                top_p, child_p, parent_p = _normalize_added(psa_added)
-                psa_layer_obj = child_p or top_p
+                # If study_area_fc is in_memory, copy to default_gdb to ensure a FGDB-backed layer is added.
+                add_path = study_area_fc
+                needs_temp_copy = False
                 try:
-                    psa_layer_obj.name = f"Project Study Area {project_number}"
-                except:
-                    pass
-                final_psa_layer = psa_layer_obj
-                if os.path.exists(LAYERFILE_PATH):
+                    if isinstance(study_area_fc, str) and (study_area_fc.lower().startswith("in_memory") or study_area_fc.lower().startswith("memory")):
+                        needs_temp_copy = True
+                except Exception:
+                    needs_temp_copy = False
+
+                if needs_temp_copy:
+                    psa_temp_copy = os.path.join(default_gdb, f"tmp_psa_{uuid.uuid4().hex[:6]}")
                     try:
-                        dq_for_psa = build_project_defq(project_number, layer=psa_layer_obj)
+                        if arcpy.Exists(psa_temp_copy):
+                            arcpy.management.Delete(psa_temp_copy)
                     except Exception:
-                        dq_for_psa = build_project_defq(project_number)
+                        pass
+                    arcpy.management.CopyFeatures(study_area_fc, psa_temp_copy)
+                    add_path = psa_temp_copy
+                    arcpy.AddMessage(f"  • Copied PSA from in_memory to {psa_temp_copy} for reliable map insertion.")
+
+                # Use helper that adds via a temporary layerfile to avoid AUTOMATIC inference errors
+                psa_layer_obj = _add_fc_to_map_via_layerfile(site_map, add_path, display_name=f"Project Study Area {project_number}")
+
+                if psa_layer_obj:
+                    final_psa_layer = psa_layer_obj
+                    if os.path.exists(LAYERFILE_PATH):
+                        try:
+                            dq_for_psa = build_project_defq(project_number, layer=psa_layer_obj)
+                        except Exception:
+                            dq_for_psa = build_project_defq(project_number)
+                        try:
+                            final = _apply_style_swap(site_map, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=dq_for_psa)
+                            if final is not None:
+                                final_psa_layer = final
+                                arcpy.AddMessage("  ✓ Applied standard Study Area symbology to PSA by swapping.")
+                            else:
+                                try:
+                                    arcpy.management.ApplySymbologyFromLayer(psa_layer_obj, LAYERFILE_PATH)
+                                    final_psa_layer = psa_layer_obj
+                                    arcpy.AddMessage("  ✓ Applied standard Study Area symbology using ApplySymbologyFromLayer.")
+                                except Exception as e_fall:
+                                    arcpy.AddWarning(f"  - PSA ApplySymbologyFromLayer fallback failed: {e_fall}\n{traceback.format_exc()}")
+                        except Exception as eaddpsa:
+                            arcpy.AddWarning(f"  - Could not apply standard symbology to PSA: {eaddpsa}\n{traceback.format_exc()}")
                     try:
-                        final = _apply_style_swap(site_map, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=dq_for_psa)
-                        if final is not None:
-                            final_psa_layer = final
-                            arcpy.AddMessage("  ✓ Applied standard Study Area symbology to PSA by swapping.")
-                        else:
-                            try:
-                                arcpy.management.ApplySymbologyFromLayer(psa_layer_obj, LAYERFILE_PATH)
-                                final_psa_layer = psa_layer_obj
-                                arcpy.AddMessage("  ✓ Applied standard Study Area symbology using ApplySymbologyFromLayer.")
-                            except Exception as e_fall:
-                                arcpy.AddWarning(f"  - PSA ApplySymbologyFromLayer fallback failed: {e_fall}\n{traceback.format_exc()}")
-                    except Exception as eaddpsa:
-                        arcpy.AddWarning(f"  - Could not apply standard symbology to PSA: {eaddpsa}\n{traceback.format_exc()}")
+                        dq = build_project_defq(project_number, layer=final_psa_layer)
+                        if final_psa_layer and final_psa_layer.supports("DEFINITIONQUERY"):
+                            final_psa_layer.definitionQuery = dq
+                            arcpy.AddMessage("  ✓ Applied definition query to Project Study Area layer.")
+                    except Exception:
+                        pass
+                else:
+                    arcpy.AddWarning("  - Project Study Area was not added to the map; continuing without a PSA layer in the Site Details Map.")
+            except Exception as inner_psa_err:
+                arcpy.AddWarning(f"  - Error while adding/styling PSA: {inner_psa_err}\n{traceback.format_exc()}")
+            finally:
+                # Cleanup any temporary PSA copy we created in the default_gdb
                 try:
-                    dq = build_project_defq(project_number, layer=final_psa_layer)
-                    if final_psa_layer and final_psa_layer.supports("DEFINITIONQUERY"):
-                        final_psa_layer.definitionQuery = dq
-                        arcpy.AddMessage("  ✓ Applied definition query to Project Study Area layer.")
+                    if psa_temp_copy and arcpy.Exists(psa_temp_copy):
+                        arcpy.management.Delete(psa_temp_copy)
                 except Exception:
                     pass
-            except Exception as eaddpsa:
-                arcpy.AddWarning(f"  - Could not add Project Study Area layer to 'Site Details Map': {eaddpsa}\n{traceback.format_exc()}")
+
             # Refresh preexisting names (PSA now present but considered new)
             try:
                 preexisting_layer_names = {getattr(lyr, "name", "") for lyr in site_map.listLayers() if getattr(lyr, "name", "")}
@@ -914,68 +1040,59 @@ def run_import_std_site_layers(project_number, overwrite_flag=False, force_reque
                 arcpy.AddMessage(f"  ✓ Extracted '{short_name}' to {out_fc}")
                 processed_outputs.append({"shortname": short_name, "path": out_fc, "style": style_file, "fd": feature_dataset_name, "safe_short": safe_short})
 
-                # Add to map and apply style
+                # Add to map and apply style (ensure it's the FGDB feature class that is added and styled)
                 try:
                     if site_map:
-                        data_added = site_map.addDataFromPath(out_fc)
-                        top_added, added_child, parent_added = _normalize_added(data_added)
-                        data_layer = added_child or top_added
-                        final_layer = data_layer
-                        try:
-                            data_layer.name = short_name
-                        except Exception:
-                            pass
+                        final_layer = _add_fc_to_map_via_layerfile(site_map, out_fc, display_name=short_name)
 
-                        if style_file:
-                            style_path = os.path.expanduser(style_file)
-                            if not os.path.isabs(style_path):
-                                try_paths = [
-                                    style_path,
-                                    os.path.join(os.path.dirname(arcpy.mp.ArcGISProject("CURRENT").filePath or ""), style_path),
-                                    os.path.join(default_gdb, style_path)
-                                ]
-                            else:
-                                try_paths = [style_path]
+                        if not final_layer:
+                            arcpy.AddWarning(f"  - Could not add FGDB layer for '{short_name}' to map; skipping styling and map placement for this layer.")
+                        else:
+                            if style_file:
+                                style_path = os.path.expanduser(style_file)
+                                if not os.path.isabs(style_path):
+                                    try_paths = [
+                                        style_path,
+                                        os.path.join(os.path.dirname(arcpy.mp.ArcGISProject("CURRENT").filePath or ""), style_path),
+                                        os.path.join(default_gdb, style_path)
+                                    ]
+                                else:
+                                    try_paths = [style_path]
 
-                            applied = False
-                            for sp in try_paths:
-                                try:
-                                    arcpy.AddMessage(f"  - Checking style candidate: {sp} (exists: {os.path.exists(sp)})")
-                                    if not os.path.exists(sp):
-                                        continue
-                                    final = _apply_style_swap(site_map, data_layer, sp, display_name=short_name)
-                                    if final:
-                                        final_layer = final
-                                        applied = True
-                                        arcpy.AddMessage(f"  ✓ Applied style from '{sp}' by swapping for '{short_name}'.")
-                                        break
-                                    else:
-                                        try:
-                                            arcpy.management.ApplySymbologyFromLayer(data_layer, sp)
-                                            final_layer = data_layer
-                                            applied = True
-                                            arcpy.AddMessage(f"  ✓ Applied style from '{sp}' using ApplySymbologyFromLayer for '{short_name}'.")
-                                            break
-                                        except Exception as e_f:
-                                            arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback also failed for '{sp}': {e_f}\n{traceback.format_exc()}")
-                                            try:
-                                                if parent_added:
-                                                    site_map.removeLayer(parent_added)
-                                            except:
-                                                pass
+                                applied = False
+                                for sp in try_paths:
+                                    try:
+                                        arcpy.AddMessage(f"  - Checking style candidate: {sp} (exists: {os.path.exists(sp)})")
+                                        if not os.path.exists(sp):
                                             continue
-                                except Exception:
-                                    continue
-                            if not applied:
-                                arcpy.AddMessage(f"  - No valid style file found or applied for '{short_name}' (checked {len(try_paths)} locations).")
+                                        # Attempt to swap/import style and re-point to FGDB layer; if that succeeds the style layer becomes final
+                                        final_after_style = _apply_style_swap(site_map, final_layer, sp, display_name=short_name)
+                                        if final_after_style:
+                                            final_layer = final_after_style
+                                            applied = True
+                                            arcpy.AddMessage(f"  ✓ Applied style from '{sp}' by swapping for '{short_name}'.")
+                                            break
+                                        else:
+                                            # Fallback: apply symbology directly to the FGDB-backed map layer
+                                            try:
+                                                arcpy.management.ApplySymbologyFromLayer(final_layer, sp)
+                                                applied = True
+                                                arcpy.AddMessage(f"  ✓ Applied style from '{sp}' using ApplySymbologyFromLayer for '{short_name}'.")
+                                                break
+                                            except Exception as e_f:
+                                                arcpy.AddWarning(f"  - ApplySymbologyFromLayer fallback also failed for '{sp}': {e_f}\n{traceback.format_exc()}")
+                                                continue
+                                    except Exception:
+                                        continue
+                                if not applied:
+                                    arcpy.AddMessage(f"  - No valid style file found or applied for '{short_name}' (checked {len(try_paths)} locations).")
 
-                        try:
-                            _cleanup_duplicates(site_map, final_layer, short_name, preexisting_names=preexisting_layer_names)
-                        except Exception:
-                            pass
-                except Exception as add_err:
-                    arcpy.AddWarning(f"  - Could not add '{out_fc}' to 'Site Details Map': {add_err}\n{traceback.format_exc()}")
+                            try:
+                                _cleanup_duplicates(site_map, final_layer, short_name, preexisting_names=preexisting_layer_names)
+                            except Exception:
+                                pass
 
+                # end site_map block
             except Exception as e:
                 arcpy.AddWarning(f"  - Could not move temporary extract to final location for '{short_name}': {e}\n{traceback.format_exc()}")
                 failed.append(short_name)
@@ -1082,28 +1199,7 @@ def run_import_std_site_layers(project_number, overwrite_flag=False, force_reque
                 except:
                     pass
 
-        # Create PCT report via external helper if available
-        arcpy.AddMessage("Creating PCT_REPORT (external helper) ...")
-        pct_fc = None
-        for po in processed_outputs:
-            if "pct" in po["shortname"].lower() or "svtm_pct" in po["shortname"].lower():
-                pct_fc = po["path"]
-                break
-
-        if not pct_fc:
-            arcpy.AddWarning("Could not find an SVTM_PCT layer among processed outputs. Skipping PCT_REPORT.")
-        else:
-            if create_pct_report is not None:
-                try:
-                    pct_table = create_pct_report(pct_fc, default_gdb, site_area_m2)
-                    if pct_table:
-                        arcpy.AddMessage(f"  ✓ PCT_Report created at {pct_table}")
-                    else:
-                        arcpy.AddWarning("  - PCT_Report helper ran but did not create a table.")
-                except Exception as e:
-                    arcpy.AddWarning(f"  - Could not create PCT_Report via helper: {e}\n{traceback.format_exc()}")
-            else:
-                arcpy.AddWarning("  - External pct_report helper not available; skipping PCT_Report creation.")
+        # Note: PCT report creation has been removed per request.
 
         # Final summary messages
         arcpy.AddMessage("\nExtraction summary:")

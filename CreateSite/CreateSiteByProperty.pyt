@@ -1,4 +1,3 @@
-```python
 # CreateSiteByProperty.pyt
 # ArcGIS Python toolbox that wraps CreateSiteByProperty.run_create_site
 # This toolbox provides the GUI/parameters, calls the refactored script, and reports results via arcpy.AddMessage/Errors.
