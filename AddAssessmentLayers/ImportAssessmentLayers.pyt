@@ -5,6 +5,7 @@ import random
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 import json
 import ssl
 
@@ -32,31 +33,48 @@ class ImportStdSiteLayersTool(object):
         param0.filter.type = "ValueList"
         param0.filter.list = [] 
 
-        # Param 1: Overwrite
+        # Param 1: Additional Project Types (multi-select) -- user-selectable types excluding 'all' and 'pct'
         param1 = arcpy.Parameter(
+            displayName="Additional Project Types to Import (optional)",
+            name="additional_project_types",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        param1.filter.type = "ValueList"
+        param1.filter.list = []
+        param1.multiValue = True
+
+        # Param 2: Overwrite
+        param2 = arcpy.Parameter(
             displayName="Overwrite existing project data",
             name="overwrite_existing",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
-        param1.value = False
+        param2.value = False
 
-        # Param 2: Refresh
-        param2 = arcpy.Parameter(
+        # Param 3: Refresh
+        param3 = arcpy.Parameter(
             displayName="Force re-query even if output exists (refresh)",
             name="force_refresh",
             datatype="GPBoolean",
             parameterType="Optional",
             direction="Input")
-        param2.value = False
+        param3.value = False
 
-        return [param0, param1, param2]
+        return [param0, param1, param2, param3]
 
     def isLicensed(self):
         return True
 
     def updateParameters(self, parameters):
+        # parameters indices:
+        # 0 = project number
+        # 1 = additional project types
         p_project = parameters[0]
+        p_types = parameters[1]
+
+        # Populate project number list (only once)
         if not p_project.filter.list:
             service_url = "https://services-ap1.arcgis.com/1awYJ9qmpKeoPyqc/arcgis/rest/services/Project_Study_Area/FeatureServer/0"
             try:
@@ -67,6 +85,24 @@ class ImportStdSiteLayersTool(object):
                 p_project.filter.list = sorted(list(unique_projects)) if unique_projects else ["No Projects Found"]
             except Exception as e:
                 p_project.filter.list = [f"ERROR: {str(e)[:100]}"]
+
+        # Populate additional project types list (exclude 'all' and 'pct')
+        if not p_types.filter.list:
+            ref_table_url = "https://services-ap1.arcgis.com/1awYJ9qmpKeoPyqc/arcgis/rest/services/Standard_Connection_Reference_Table/FeatureServer/15"
+            try:
+                unique_types = set()
+                with arcpy.da.SearchCursor(ref_table_url, ["ProjectType"], where_clause="1=1") as cursor:
+                    for row in cursor:
+                        if row[0]:
+                            val = str(row[0]).strip()
+                            if val.lower() not in ('all', 'pct'):
+                                unique_types.add(val)
+                p_types.filter.list = sorted(list(unique_types)) if unique_types else []
+            except Exception as e:
+                # don't prevent the tool from running; show something helpful
+                p_types.filter.list = []
+                arcpy.AddWarning(f"Could not populate Project Types list: {e}")
+
         return
 
     def updateMessages(self, parameters):
@@ -74,14 +110,17 @@ class ImportStdSiteLayersTool(object):
 
     def execute(self, parameters, messages):
         p_number = parameters[0].valueAsText
-        p_overwrite = parameters[1].value
-        p_refresh = parameters[2].value
+        # parameter 1 is multi-value; valueAsText returns semicolon-separated string
+        p_types_raw = parameters[1].valueAsText or ""
+        selected_types = [t.strip() for t in p_types_raw.split(';') if t.strip()] if p_types_raw else []
+        p_overwrite = parameters[2].value
+        p_refresh = parameters[3].value
         
         if "ERROR" in p_number or "Found" in p_number:
             messages.addErrorMessage("Please select a valid Project Number.")
             return
 
-        run_import_std_site_layers(p_number, p_overwrite, p_refresh)
+        run_import_std_site_layers(p_number, p_overwrite, p_refresh, selected_types)
         return
 
 # -----------------------------------------------------------------------------
@@ -103,9 +142,22 @@ def get_random_dad_joke():
     ]
     return random.choice(jokes)
 
+def make_service_url_with_token(url, token):
+    if not token:
+        return url
+    sep = '&' if '?' in url else '?'
+    return f"{url}{sep}token={urllib.parse.quote_plus(token)}"
+
 def get_object_ids_via_rest(service_url, geometry_provider, token=None):
     """
-    Queries the REST endpoint directly for ObjectIDs with Smart Token Retry logic.
+    Queries the REST endpoint directly for ObjectIDs.
+    Improvements:
+      - Try anonymous GET first (with a browser-like User-Agent header).
+      - If anonymous GET returns HTTP 403 and a token is available, retry GET with token.
+      - If GET isn't permitted (405), fall back to POST.
+      - Only emit warnings if all attempts ultimately fail.
+    This should address cases where anonymous access from ArcGIS Pro/session works in a map
+    but our earlier POST-based anonymous request was blocked by the service host.
     """
     try:
         desc = arcpy.Describe(geometry_provider)
@@ -121,36 +173,101 @@ def get_object_ids_via_rest(service_url, geometry_provider, token=None):
             'spatialRel': 'esriSpatialRelIntersects',
             'inSR': sr_code
         }
-        
-        def send_request(params):
+
+        # helper to perform a GET (preferred) or POST fallback
+        def send_request_try_get(params, include_token=False):
+            # build params, optionally include token
+            params_to_send = params.copy()
+            if include_token and token:
+                params_to_send['token'] = token
+
+            querystring = urllib.parse.urlencode(params_to_send)
+            url = f"{query_url}?{querystring}"
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)',
+                # Some hosts check referer; leaving it out unless needed.
+            }
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            data = urllib.parse.urlencode(params).encode('utf-8')
-            req = urllib.request.Request(query_url, data)
-            with urllib.request.urlopen(req, context=ctx) as response:
-                return json.loads(response.read().decode('utf-8'))
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
+                    return json.loads(response.read().decode('utf-8'))
+            except urllib.error.HTTPError as he:
+                return {'http_error': he.code, 'message': str(he)}
+            except Exception as ex:
+                return {'http_error': None, 'message': str(ex)}
 
-        result = None
-        # Attempt A: With Token
-        if token:
-            params = base_params.copy()
-            params['token'] = token
-            result = send_request(params)
-            if 'error' in result and result['error']['code'] in [498, 499]:
-                arcpy.AddMessage("    (Token rejected by server. Retrying as anonymous request...)")
-                result = None 
-        
-        # Attempt B: Without Token
-        if result is None:
-            params = base_params.copy() 
-            result = send_request(params)
-            
-        if 'error' in result:
-            arcpy.AddWarning(f"    Rest API Error: {result['error']}")
+        def send_request_post(params, include_token=False):
+            params_to_send = params.copy()
+            if include_token and token:
+                params_to_send['token'] = token
+            data = urllib.parse.urlencode(params_to_send).encode('utf-8')
+            url = query_url
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(url, data=data, headers=headers)
+            try:
+                with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
+                    return json.loads(response.read().decode('utf-8'))
+            except urllib.error.HTTPError as he:
+                return {'http_error': he.code, 'message': str(he)}
+            except Exception as ex:
+                return {'http_error': None, 'message': str(ex)}
+
+        # 1) Try anonymous GET
+        anon_result = send_request_try_get(base_params, include_token=False)
+
+        # If anonymous GET succeeded (no http_error and no 'error') return IDs
+        if not (isinstance(anon_result, dict) and ('http_error' in anon_result or 'error' in anon_result)):
+            return anon_result.get('objectIds', [])
+
+        # If anonymous GET returned 403 and we have a token, try GET with token
+        if isinstance(anon_result, dict) and anon_result.get('http_error') == 403 and token:
+            token_result = send_request_try_get(base_params, include_token=True)
+            if not (isinstance(token_result, dict) and ('http_error' in token_result or 'error' in token_result)):
+                # token GET succeeded -> do NOT warn
+                return token_result.get('objectIds', [])
+            # token GET also failed -> keep token_result as final error
+            final_error = token_result
+        else:
+            # if anonymous GET returned 405 (method not allowed) or some other HTTP error, try POST anonymously
+            final_error = anon_result
+            if isinstance(anon_result, dict) and anon_result.get('http_error') == 405:
+                post_anon = send_request_post(base_params, include_token=False)
+                if not (isinstance(post_anon, dict) and ('http_error' in post_anon or 'error' in post_anon)):
+                    return post_anon.get('objectIds', [])
+                # If post_anon failed with 403 and token exists, try post with token
+                if isinstance(post_anon, dict) and post_anon.get('http_error') == 403 and token:
+                    post_token = send_request_post(base_params, include_token=True)
+                    if not (isinstance(post_token, dict) and ('http_error' in post_token or 'error' in post_token)):
+                        return post_token.get('objectIds', [])
+                    final_error = post_token
+                else:
+                    final_error = post_anon
+
+        # If we've reached here, all reasonable attempts failed — emit a single warning and return []
+        if isinstance(final_error, dict) and 'error' in final_error:
+            try:
+                err_code = final_error['error'].get('code')
+                if err_code in [498, 499]:
+                    arcpy.AddWarning("    Token invalid or expired.")
+                    return []
+            except Exception:
+                pass
+            arcpy.AddWarning(f"    Rest API Error: {final_error['error']}")
             return []
-            
-        return result.get('objectIds', [])
+
+        if isinstance(final_error, dict) and final_error.get('http_error') is not None:
+            arcpy.AddWarning(f"    Failed to query IDs via REST: HTTP Error {final_error.get('http_error')} - {final_error.get('message')}")
+            return []
+
+        # Unknown failure case
+        arcpy.AddWarning("    Failed to query IDs via REST: Unknown error.")
+        return []
     except Exception as e:
         arcpy.AddWarning(f"    Failed to query IDs via REST: {e}")
         return []
@@ -158,7 +275,7 @@ def get_object_ids_via_rest(service_url, geometry_provider, token=None):
 # -----------------------------------------------------------------------------
 # LOGIC FUNCTION
 # -----------------------------------------------------------------------------
-def run_import_std_site_layers(project_number, overwrite_existing, force_refresh):
+def run_import_std_site_layers(project_number, overwrite_existing, force_refresh, additional_project_types=None):
     
     # 1. CONFIGURATION
     ref_table_path = "https://services-ap1.arcgis.com/1awYJ9qmpKeoPyqc/arcgis/rest/services/Standard_Connection_Reference_Table/FeatureServer/15"
@@ -195,7 +312,7 @@ def run_import_std_site_layers(project_number, overwrite_existing, force_refresh
     if license_level == 'ArcView': can_alter_alias = False
 
     arcpy.AddMessage("============================================================")
-    arcpy.AddMessage("STEP 4 - ADD PCT LAYERS (Symbology Edition)")
+    arcpy.AddMessage("STEP 4 - ADD SPECIFIED TYPES (Symbology Edition)")
     arcpy.AddMessage("============================================================")
     
     # 2. GET PROJECT STUDY AREA
@@ -217,18 +334,30 @@ def run_import_std_site_layers(project_number, overwrite_existing, force_refresh
     arcpy.AddMessage("📖 Reading the sacred scrolls (Reference Table)...")
     layers_to_process = []
     
-    fields = ['ShortName', 'URL', 'SiteBuffer', 'SortOrder', 'FeatureDatasetName', 'FieldAlias']
+    # include ProjectType in the reference read so we can filter by selected types
+    fields = ['ShortName', 'URL', 'SiteBuffer', 'SortOrder', 'FeatureDatasetName', 'FieldAlias', 'ProjectType']
     try:
-        with arcpy.da.SearchCursor(ref_table_path, fields, where_clause="ProjectType = 'pct'", sql_clause=(None, "ORDER BY SortOrder")) as cursor:
+        # Normalize selection list for comparison (case-insensitive)
+        lowered_sel = [t.lower() for t in additional_project_types] if additional_project_types else []
+        with arcpy.da.SearchCursor(ref_table_path, fields, where_clause="1=1", sql_clause=(None, "ORDER BY SortOrder")) as cursor:
             for row in cursor:
-                layers_to_process.append({
-                    'name': row[0],
-                    'source': row[1],
-                    'buffer': 0 if row[2] is None else int(row[2]),
-                    'dataset': row[4],
-                    'alias': row[5]
-                })
-        arcpy.AddMessage(f"  ✓ Found {len(layers_to_process)} layers.")
+                proj_type = (row[6] or "").strip()
+                # Only include rows that match user selections. If user selected nothing, include nothing.
+                if lowered_sel:
+                    if proj_type and proj_type.lower() in lowered_sel:
+                        layers_to_process.append({
+                            'name': row[0],
+                            'source': row[1],
+                            'buffer': 0 if row[2] is None else int(row[2]),
+                            'dataset': row[4],
+                            'alias': row[5],
+                            'project_type': proj_type
+                        })
+        if lowered_sel:
+            arcpy.AddMessage(f"  ✓ Found {len(layers_to_process)} layers to process (selected types: {', '.join(additional_project_types)})")
+        else:
+            arcpy.AddMessage("  ✓ No additional project types selected — nothing to process.")
+            return
     except Exception as e:
         arcpy.AddError(f"FAILED to read Reference Table: {e}")
         return
@@ -247,6 +376,7 @@ def run_import_std_site_layers(project_number, overwrite_existing, force_refresh
         buff_dist = item['buffer']
         fd_name = item['dataset']
         table_alias = item['alias']
+        row_proj_type = item.get('project_type', '')
         
         # Output Paths
         target_container = target_gdb
@@ -260,7 +390,7 @@ def run_import_std_site_layers(project_number, overwrite_existing, force_refresh
             
         output_fc = os.path.join(target_container, name)
         
-        arcpy.AddMessage(f"Processing {i}: {name} (Buffer: {buff_dist}m)")
+        arcpy.AddMessage(f"Processing {i}: {name} (Buffer: {buff_dist}m) [type: {row_proj_type}]")
 
         if arcpy.Exists(output_fc) and not overwrite_existing and not force_refresh:
             arcpy.AddMessage(f"  • Already there! (Skipped)")
@@ -295,13 +425,16 @@ def run_import_std_site_layers(project_number, overwrite_existing, force_refresh
             arcpy.AddMessage(f"  • Found {len(object_ids)} candidate features.")
             BATCH_SIZE = 20 
             
-            # Determine OID Field
+            # Determine OID Field (use token-aware service URL)
             try:
                 temp_desc = "probe_layer"
-                arcpy.management.MakeFeatureLayer(source_url, temp_desc, "1=0")
+                probe_service = make_service_url_with_token(source_url, agol_token)
+                if arcpy.Exists(temp_desc): arcpy.management.Delete(temp_desc)
+                arcpy.management.MakeFeatureLayer(probe_service, temp_desc, "1=0")
                 oid_field = arcpy.Describe(temp_desc).OIDFieldName
                 arcpy.management.Delete(temp_desc)
-            except: oid_field = "OBJECTID"
+            except:
+                oid_field = "OBJECTID"
 
             arcpy.AddMessage(f"  • Step 2: Downloading...")
             merged_memory_fc = r"memory\merged_download"
@@ -316,7 +449,9 @@ def run_import_std_site_layers(project_number, overwrite_existing, force_refresh
                 if arcpy.Exists(chunk_layer): arcpy.management.Delete(chunk_layer)
                 
                 try:
-                    arcpy.management.MakeFeatureLayer(source_url, chunk_layer, where_clause)
+                    # use token-aware service url for MakeFeatureLayer
+                    service_with_token = make_service_url_with_token(source_url, agol_token)
+                    arcpy.management.MakeFeatureLayer(service_with_token, chunk_layer, where_clause)
                     chunk_fc = f"memory\\chunk_{index}"
                     arcpy.management.CopyFeatures(chunk_layer, chunk_fc)
                     
@@ -327,18 +462,23 @@ def run_import_std_site_layers(project_number, overwrite_existing, force_refresh
                     arcpy.management.Delete(chunk_fc)
                     
                 except Exception as batch_err:
-                    arcpy.AddWarning(f"    ! Batch {index+1} failed. Activating Single-Feature Rescue Mode...")
+                    arcpy.AddWarning(f"    ! Batch {index+1} failed ({batch_err}). Activating Single-Feature Rescue Mode...")
                     for single_id in chunk:
                         try:
                             res_lyr = "res_lyr"
                             if arcpy.Exists(res_lyr): arcpy.management.Delete(res_lyr)
-                            arcpy.management.MakeFeatureLayer(source_url, res_lyr, f"{oid_field} = {single_id}")
+                            service_with_token = make_service_url_with_token(source_url, agol_token)
+                            arcpy.management.MakeFeatureLayer(service_with_token, res_lyr, f"{oid_field} = {single_id}")
                             res_fc = f"memory\\res_{single_id}"
                             arcpy.management.CopyFeatures(res_lyr, res_fc)
-                            if not arcpy.Exists(merged_memory_fc): arcpy.management.CopyFeatures(res_fc, merged_memory_fc)
-                            else: arcpy.management.Append(res_fc, merged_memory_fc, "NO_TEST")
-                            for x in [res_lyr, res_fc]: arcpy.management.Delete(x)
-                        except: pass
+                            if not arcpy.Exists(merged_memory_fc):
+                                arcpy.management.CopyFeatures(res_fc, merged_memory_fc)
+                            else:
+                                arcpy.management.Append(res_fc, merged_memory_fc, "NO_TEST")
+                            for x in [res_lyr, res_fc]:
+                                if arcpy.Exists(x): arcpy.management.Delete(x)
+                        except Exception as single_err:
+                            arcpy.AddWarning(f"      ! Single-feature rescue failed for OID {single_id}: {single_err}")
                 
                 if arcpy.Exists(chunk_layer): arcpy.management.Delete(chunk_layer)
                 time.sleep(0.1)
@@ -357,7 +497,8 @@ def run_import_std_site_layers(project_number, overwrite_existing, force_refresh
                     # 1. Create a layer from the Service URL (this holds the styling)
                     temp_service_style = "temp_service_style"
                     if arcpy.Exists(temp_service_style): arcpy.management.Delete(temp_service_style)
-                    arcpy.management.MakeFeatureLayer(source_url, temp_service_style)
+                    service_for_style = make_service_url_with_token(source_url, agol_token)
+                    arcpy.management.MakeFeatureLayer(service_for_style, temp_service_style)
                     
                     # 2. Create a layer from our new Local Data
                     temp_local_lyr = f"lyr_{name}"
