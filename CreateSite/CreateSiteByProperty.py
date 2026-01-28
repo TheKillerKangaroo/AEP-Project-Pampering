@@ -73,6 +73,32 @@ def build_project_defq(project_number, layer=None):
     return f"project_number = {quoted(pn)} AND EndDate IS NULL"
 
 
+def build_project_defq_enddate_before_today(project_number):
+    """
+    Build a WHERE clause for project_number + EndDate < CURRENT_DATE
+    for use in layer definition queries (does NOT affect archiving logic).
+    """
+    if project_number is None:
+        return "EndDate < CURRENT_DATE"
+
+    pn = str(project_number).strip()
+
+    def quoted(val):
+        return "'" + val.replace("'", "''") + "'"
+
+    if pn.isdigit():
+        return f"project_number = {int(pn)} AND EndDate < CURRENT_DATE"
+
+    try:
+        f = float(pn)
+        if f.is_integer():
+            return f"project_number = {int(f)} AND EndDate < CURRENT_DATE"
+    except Exception:
+        pass
+
+    return f"project_number = {quoted(pn)} AND EndDate < CURRENT_DATE"
+
+
 def _get_token():
     try:
         info = arcpy.GetSigninToken()
@@ -677,10 +703,13 @@ def run_create_site(site_address, project_number, project_name,
                     if os.path.exists(LAYERFILE_PATH):
                         applied = False
                         try:
+                            # For the map layer, use a definition query
+                            # that shows records where EndDate is before today
+                            # (instead of the archiving logic, which uses EndDate IS NULL).
                             try:
-                                dq_for_psa = build_project_defq(project_number, layer=psa_layer_obj)
+                                dq_for_psa = build_project_defq_enddate_before_today(project_number)
                             except Exception:
-                                dq_for_psa = build_project_defq(project_number)
+                                dq_for_psa = "EndDate < CURRENT_DATE"
 
                             final = _apply_style_swap(map_obj, psa_layer_obj, LAYERFILE_PATH, display_name=f"Project Study Area {project_number}", set_defq=dq_for_psa)
                             if final is not None:
@@ -700,8 +729,8 @@ def run_create_site(site_address, project_number, project_name,
 
                         try:
                             if final_psa and final_psa.supports("DEFINITIONQUERY"):
-                                final_psa.definitionQuery = build_project_defq(project_number, layer=final_psa)
-                                arcpy.AddMessage("  ✓ Applied definition query to Project Study Area layer.")
+                                final_psa.definitionQuery = build_project_defq_enddate_before_today(project_number)
+                                arcpy.AddMessage("  ✓ Applied definition query to Project Study Area layer (EndDate < CURRENT_DATE).")
                         except Exception:
                             pass
                     else:
