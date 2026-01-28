@@ -12,9 +12,9 @@ class Toolbox(object):
     def __init__(self):
         self.label = "Project Creation Toolbox"
         self.alias = "project_creation"
-        self.tools = [ImportStdSiteLayersTool]
+        self.tools = [ImportPCTLayerTool]
 
-class ImportStdSiteLayersTool(object):
+class ImportPCTLayerTool(object):
     def __init__(self):
         self.label = "Import Standard Site Layers"
         self.description = "Imports site layers, extracts styling, and saves .lyrx files."
