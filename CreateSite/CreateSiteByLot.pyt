@@ -70,7 +70,8 @@ class CreateSiteByLots(object):
         f_proj_num = "project_number"
         f_desc     = "ProjectName"
         f_end_date = "EndDate"
-        f_area     = "Area_Ha"
+        # Keep consistent with `CreateSiteByProperty.py` / service schema
+        f_area     = "Area_ha"
         
         # ---------------------
 
