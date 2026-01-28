@@ -548,7 +548,10 @@ def run_create_site(site_address, project_number, project_name,
             ("SiteArea", "DOUBLE", None),
             ("AreaUnits", "TEXT", 20),
             ("Area_ha", "DOUBLE", None),
-            ("Comments", "TEXT", 255)
+            ("Comments", "TEXT", 255),
+            # Ensure EndDate exists locally so we can explicitly set it to NULL
+            # for the new record written to the feature service.
+            ("EndDate", "DATE", None),
         ]
 
         for fname, ftype, flen in target_fields:
@@ -558,7 +561,11 @@ def run_create_site(site_address, project_number, project_name,
                 else:
                     arcpy.management.AddField(working_fc, fname, ftype)
 
-        with arcpy.da.UpdateCursor(working_fc, ["SHAPE@", "project_number", "ProjectName", "GeocodedAddress", "SiteArea", "AreaUnits", "Area_ha"]) as cursor:
+        # Include EndDate so we can force it to NULL on the new record.
+        with arcpy.da.UpdateCursor(
+            working_fc,
+            ["SHAPE@", "project_number", "ProjectName", "GeocodedAddress", "SiteArea", "AreaUnits", "Area_ha", "EndDate"],
+        ) as cursor:
             for row in cursor:
                 area_sqm = row[0].getArea("GEODESIC", "SQUAREMETERS")
                 area_ha = area_sqm / 10000.0
@@ -570,6 +577,8 @@ def run_create_site(site_address, project_number, project_name,
                 row[4] = area_ha if area_units == "hectares" else area_sqm
                 row[5] = area_units
                 row[6] = area_ha
+                # Explicitly clear EndDate so the appended feature is active.
+                row[7] = None
                 cursor.updateRow(row)
 
         arcpy.AddMessage(f"  ✓ Site area: {area_ha:.2f} hectares")
