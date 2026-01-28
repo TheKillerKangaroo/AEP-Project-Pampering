@@ -16,8 +16,8 @@ class Toolbox(object):
 
 class ImportPCTLayerTool(object):
     def __init__(self):
-        self.label = "Import Standard Site Layers"
-        self.description = "Imports site layers, extracts styling, and saves .lyrx files."
+        self.label = "Import PCT Layer"
+        self.description = "Imports PCT layers, extracts styling, and saves .lyrx files."
         self.canRunInBackground = False
 
     def getParameterInfo(self):
